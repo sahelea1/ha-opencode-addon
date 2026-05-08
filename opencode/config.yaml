@@ -33,14 +33,12 @@ ports:
 ports_description:
   8099/tcp: "OpenCode Web UI (direct access)"
 
-# User-configurable options
+# Only the safety-guardian timeout is configured here.
+# Provider, API keys, and login are entered interactively in the OpenCode
+# web UI; they persist in /data/opencode-config and /data/opencode-share
+# (symlinked into ~/.config/opencode and ~/.local/share/opencode), so they
+# survive add-on restarts and rebuilds.
 options:
-  ANTHROPIC_API_KEY: ""
-  OPENAI_API_KEY: ""
-  provider: "anthropic"
   confirm_timeout_minutes: 10
 schema:
-  ANTHROPIC_API_KEY: "str?"
-  OPENAI_API_KEY: "str?"
-  provider: "list(anthropic|openai|openrouter)?"
   confirm_timeout_minutes: "int(1,60)?"

@@ -7,7 +7,10 @@ echo "========================================"
 
 # ----------------------------------------------------------
 # 1. Persistence — symlink OpenCode data dirs to /data
-#    /data is the add-on's persistent volume (survives restarts)
+#    /data is the add-on's persistent volume (survives restarts and
+#    rebuilds). API keys, provider selection, login state, and any
+#    other config the user enters in the OpenCode UI live in these
+#    dirs and persist automatically.
 # ----------------------------------------------------------
 mkdir -p /data/opencode-config
 mkdir -p /data/opencode-share
@@ -21,43 +24,21 @@ ln -sfn /data/opencode-share  /root/.local/share/opencode
 echo "[init] Persistent storage linked"
 
 # ----------------------------------------------------------
-# 2. Read add-on options from /data/options.json
+# 2. Read add-on options — only the guardian timeout
 # ----------------------------------------------------------
 OPTIONS_FILE="/data/options.json"
 if [ -f "$OPTIONS_FILE" ]; then
-    ANTHROPIC_KEY=$(jq -r '.ANTHROPIC_API_KEY // empty' "$OPTIONS_FILE")
-    OPENAI_KEY=$(jq -r '.OPENAI_API_KEY // empty' "$OPTIONS_FILE")
-    PROVIDER=$(jq -r '.provider // "anthropic"' "$OPTIONS_FILE")
     TIMEOUT_MIN=$(jq -r '.confirm_timeout_minutes // 10' "$OPTIONS_FILE")
-
-    [ -n "$ANTHROPIC_KEY" ] && export ANTHROPIC_API_KEY="$ANTHROPIC_KEY"
-    [ -n "$OPENAI_KEY" ]    && export OPENAI_API_KEY="$OPENAI_KEY"
-
-    echo "[init] Provider: ${PROVIDER}"
     echo "[init] Confirm timeout: ${TIMEOUT_MIN} minutes"
 else
-    PROVIDER="anthropic"
     TIMEOUT_MIN=10
-    echo "[init] No options file found, using defaults"
+    echo "[init] No options file found, using default 10 minutes"
 fi
 
 export GUARDIAN_TIMEOUT_MIN="$TIMEOUT_MIN"
 
 # ----------------------------------------------------------
-# 3. Create minimal OpenCode config if none exists
-# ----------------------------------------------------------
-OC_CONFIG="/data/opencode-config/opencode.json"
-if [ ! -f "$OC_CONFIG" ]; then
-    cat > "$OC_CONFIG" << EOF
-{
-  "provider": "${PROVIDER}"
-}
-EOF
-    echo "[init] Created initial opencode.json"
-fi
-
-# ----------------------------------------------------------
-# 4. Initialize git in /config for change tracking (if needed)
+# 3. Initialize git in /config for change tracking (if needed)
 # ----------------------------------------------------------
 cd /config
 if [ ! -d ".git" ]; then
@@ -68,7 +49,7 @@ if [ ! -d ".git" ]; then
 fi
 
 # ----------------------------------------------------------
-# 5. Start the guardian server (manages OpenCode + safety)
+# 4. Start the guardian server (manages OpenCode + safety)
 # ----------------------------------------------------------
 echo "[init] Starting guardian server..."
 cd /opt/guardian

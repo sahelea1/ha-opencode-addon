@@ -4,17 +4,24 @@ FROM node:20-slim
 # - git: required by OpenCode for file snapshots/undo
 # - rsync: for efficient config backup/restore
 # - jq: for parsing add-on options JSON
-# - curl: for HA Supervisor API calls
+# - curl + ca-certificates: HTTPS to opencode.ai installer
+# - unzip: the OpenCode installer extracts a release zip
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     rsync \
     jq \
     curl \
+    ca-certificates \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenCode globally via npm
-# node:20-slim is Debian/glibc — avoids the known musl/Alpine postinstall hang
-RUN npm install -g opencode-ai
+# Install OpenCode using the official installer.
+# It downloads the prebuilt platform binary directly from GitHub
+# releases, avoiding the broken npm postinstall path.
+RUN curl -fsSL https://opencode.ai/install | bash
+
+# Installer drops the binary into ~/.opencode/bin — make it discoverable.
+ENV PATH="/root/.opencode/bin:${PATH}"
 
 # Install guardian dependencies
 WORKDIR /opt/guardian
