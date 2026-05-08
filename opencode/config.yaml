@@ -11,6 +11,9 @@ arch:
 startup: application
 boot: auto
 
+# We run Node directly as PID 1 — no s6-overlay
+init: false
+
 # Access to HA Supervisor API (for reload/restart)
 hassio_api: true
 homeassistant_api: true
