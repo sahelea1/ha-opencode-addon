@@ -491,94 +491,247 @@ proxy.on("error", (err, req, res) => {
 
 // Fallback page shown while OpenCode boots up
 const LOADING_PAGE = `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <title>OpenCode — Starting</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="refresh" content="3">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #0d1117;
-      color: #c9d1d9;
-      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+    :root{
+      --surface:#0a0e1a; --surface-1:#141828; --surface-2:#1c2238;
+      --primary:#a78bfa; --primary-2:#7c5cec; --text:#e2e8f0; --muted:#94a3b8;
     }
-    .loader { text-align: center; }
-    .spinner {
-      width: 40px; height: 40px;
-      border: 3px solid #21262d;
-      border-top-color: #58a6ff;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      margin: 0 auto 20px;
+    body{
+      min-height:100dvh;background:
+        radial-gradient(1200px 600px at 70% -10%,rgba(124,92,236,.18),transparent 60%),
+        radial-gradient(900px 600px at -10% 110%,rgba(89,78,234,.16),transparent 55%),
+        var(--surface);
+      color:var(--text);
+      font:500 14px/1.5 'Inter','SF Pro Text',-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;
+      -webkit-font-smoothing:antialiased;
+      display:flex;align-items:center;justify-content:center;padding:24px;
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    h1 { font-size: 18px; font-weight: 500; margin-bottom: 8px; }
-    p { font-size: 13px; color: #8b949e; }
+    .card{
+      width:100%;max-width:380px;text-align:center;
+      background:linear-gradient(180deg,rgba(28,34,56,.72),rgba(20,24,40,.72));
+      border:1px solid rgba(167,139,250,.18);border-radius:24px;
+      padding:36px 28px;
+      box-shadow:
+        0 1px 0 rgba(255,255,255,.04) inset,
+        0 24px 60px rgba(8,10,24,.55),
+        0 0 0 1px rgba(167,139,250,.08);
+      backdrop-filter:saturate(180%) blur(16px);
+      -webkit-backdrop-filter:saturate(180%) blur(16px);
+    }
+    .logo{
+      width:64px;height:64px;border-radius:18px;margin:0 auto 22px;
+      background:linear-gradient(135deg,#594EEA 0%,#7C5CEC 50%,#A259E6 100%);
+      box-shadow:0 12px 28px rgba(124,92,236,.45),
+                 inset 0 1px 0 rgba(255,255,255,.18);
+      display:flex;align-items:center;justify-content:center;
+      color:#fff;font:800 24px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
+      letter-spacing:-1.5px;
+    }
+    h1{font-size:18px;font-weight:600;color:#f1f5f9;letter-spacing:-.01em;margin-bottom:6px;}
+    p{font-size:13px;color:var(--muted);}
+    .progress{
+      margin:24px auto 0;width:200px;height:4px;border-radius:2px;
+      background:rgba(255,255,255,.05);overflow:hidden;
+    }
+    .progress::after{
+      content:"";display:block;width:40%;height:100%;border-radius:2px;
+      background:linear-gradient(90deg,transparent,var(--primary),transparent);
+      animation:slide 1.4s cubic-bezier(.4,0,.2,1) infinite;
+    }
+    @keyframes slide{
+      0%  {transform:translateX(-100%);}
+      100%{transform:translateX(350%);}
+    }
   </style>
 </head>
 <body>
-  <div class="loader">
-    <div class="spinner"></div>
-    <h1>OpenCode is starting up…</h1>
-    <p>This page will refresh automatically.</p>
+  <div class="card">
+    <div class="logo">{}</div>
+    <h1>Starting OpenCode</h1>
+    <p>This will refresh automatically once the server is ready.</p>
+    <div class="progress" aria-hidden="true"></div>
   </div>
 </body>
 </html>`;
 
-// Guardian status page (fallback if injection fails)
-function getStatusPage() {
+// Guardian status page (fallback if banner injection fails or for direct visits)
+function getStatusPage(req) {
   const remaining = state.deadline
     ? Math.max(0, state.deadline - Date.now())
     : null;
   const min = remaining ? Math.floor(remaining / 60000) : 0;
   const sec = remaining ? Math.ceil((remaining % 60000) / 1000) : 0;
+  const ingressPath = req && req.headers["x-ingress-path"]
+    ? req.headers["x-ingress-path"].replace(/\/$/, "")
+    : "";
+  const isPending = state.status === "pending";
+  const filesList = (state.changedFiles || [])
+    .map((f) => `<li><code>${f.replace(/[<>&]/g, "")}</code></li>`)
+    .join("");
 
   return `<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Config Guardian</title>
+  <title>Config Guardian — OpenCode</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="refresh" content="5">
   <style>
-    * { margin:0; padding:0; box-sizing:border-box; }
-    body { min-height:100vh; background:#0d1117; color:#c9d1d9;
-           font-family:'SF Mono','Fira Code',monospace; padding:40px; }
-    h1 { font-size:20px; margin-bottom:20px; color:#58a6ff; }
-    .status { padding:16px; border-radius:8px; margin-bottom:16px;
-              background:#161b22; border:1px solid #30363d; }
-    .idle { border-left:4px solid #3fb950; }
-    .pending { border-left:4px solid #d29922; }
-    .timer { font-size:28px; font-weight:bold; color:#d29922; }
-    .files { font-size:12px; color:#8b949e; margin-top:8px; }
-    .actions { margin-top:16px; display:flex; gap:12px; }
-    .btn { padding:8px 24px; border:none; border-radius:6px;
-           font-size:14px; font-weight:600; cursor:pointer;
-           font-family:inherit; }
-    .btn-confirm { background:#238636; color:#fff; }
-    .btn-revert { background:#da3633; color:#fff; }
-    .btn:hover { filter:brightness(1.15); }
-    .btn:disabled { opacity:0.4; cursor:default; filter:none; }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+    :root{
+      --surface:#0a0e1a; --surface-1:#141828; --surface-2:#1c2238;
+      --primary:#a78bfa; --primary-2:#7c5cec;
+      --success:#22c55e; --warning:#f59e0b; --danger:#f43f5e;
+      --text:#e2e8f0; --muted:#94a3b8; --border:rgba(167,139,250,.18);
+    }
+    html,body{height:100%;}
+    body{
+      background:
+        radial-gradient(1200px 600px at 80% -10%,rgba(124,92,236,.16),transparent 60%),
+        radial-gradient(900px 500px at -10% 110%,rgba(89,78,234,.14),transparent 55%),
+        var(--surface);
+      color:var(--text);
+      font:500 14px/1.5 'Inter','SF Pro Text',-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;
+      -webkit-font-smoothing:antialiased;
+      display:flex;align-items:center;justify-content:center;padding:24px;
+    }
+    .wrap{width:100%;max-width:560px;}
+    .header{display:flex;align-items:center;gap:14px;margin-bottom:20px;}
+    .logo{
+      width:48px;height:48px;border-radius:14px;flex-shrink:0;
+      background:linear-gradient(135deg,#594EEA 0%,#7C5CEC 50%,#A259E6 100%);
+      box-shadow:0 8px 22px rgba(124,92,236,.45),inset 0 1px 0 rgba(255,255,255,.18);
+      display:flex;align-items:center;justify-content:center;color:#fff;
+      font:800 19px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
+      letter-spacing:-1.2px;
+    }
+    .header h1{font-size:20px;font-weight:600;color:#f1f5f9;letter-spacing:-.01em;}
+    .header p{font-size:13px;color:var(--muted);}
+
+    .card{
+      background:linear-gradient(180deg,rgba(28,34,56,.72),rgba(20,24,40,.72));
+      border:1px solid var(--border);border-radius:20px;
+      padding:24px;
+      box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 18px 48px rgba(8,10,24,.45);
+      backdrop-filter:saturate(180%) blur(16px);
+      -webkit-backdrop-filter:saturate(180%) blur(16px);
+    }
+
+    .badge{
+      display:inline-flex;align-items:center;gap:8px;
+      padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;
+      letter-spacing:.02em;
+    }
+    .badge.idle{background:rgba(34,197,94,.12);color:#86efac;border:1px solid rgba(34,197,94,.3);}
+    .badge.pending{background:rgba(245,158,11,.12);color:#fcd34d;border:1px solid rgba(245,158,11,.35);}
+    .badge .dot{width:6px;height:6px;border-radius:50%;}
+    .badge.idle .dot{background:#22c55e;box-shadow:0 0 8px #22c55e;}
+    .badge.pending .dot{background:#f59e0b;box-shadow:0 0 8px #f59e0b;animation:blink 1.4s ease-in-out infinite;}
+    @keyframes blink{50%{opacity:.3;}}
+
+    .timer{
+      font:700 56px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
+      letter-spacing:-1px;color:var(--warning);
+      font-variant-numeric:tabular-nums;margin:18px 0 6px;
+    }
+    .timer.urgent{color:var(--danger);}
+    .timer-sub{font-size:13px;color:var(--muted);}
+
+    .files{
+      margin-top:18px;background:rgba(10,14,26,.6);
+      border:1px solid rgba(255,255,255,.05);border-radius:12px;
+      padding:14px 16px;
+    }
+    .files-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px;}
+    .files ul{list-style:none;display:flex;flex-direction:column;gap:4px;}
+    .files code{
+      font:500 12px/1.6 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
+      color:#cbd5e1;
+    }
+
+    .actions{display:flex;gap:10px;margin-top:22px;}
+    .btn{
+      flex:1;padding:12px 18px;border:0;border-radius:12px;
+      font:600 14px/1 inherit;letter-spacing:.02em;cursor:pointer;
+      transition:transform .12s,filter .2s,box-shadow .2s;
+      display:inline-flex;align-items:center;justify-content:center;gap:8px;
+    }
+    .btn:hover:not(:disabled){filter:brightness(1.1);transform:translateY(-1px);}
+    .btn:active:not(:disabled){transform:translateY(0);filter:brightness(.95);}
+    .btn:disabled{opacity:.35;cursor:not-allowed;}
+    .btn-confirm{
+      background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;
+      box-shadow:0 8px 22px rgba(34,197,94,.32);
+    }
+    .btn-revert{
+      background:rgba(244,63,94,.12);color:#fb7185;
+      border:1px solid rgba(244,63,94,.35);
+    }
+    .btn-revert:hover:not(:disabled){background:rgba(244,63,94,.22);}
+
+    .empty{text-align:center;padding:18px 0 6px;}
+    .empty-emoji{font-size:32px;margin-bottom:8px;}
+    .empty h2{font-size:16px;font-weight:600;color:#f1f5f9;margin-bottom:4px;}
+    .empty p{font-size:13px;color:var(--muted);}
+
+    .footer{
+      text-align:center;margin-top:18px;font-size:11px;color:#64748b;
+      letter-spacing:.04em;
+    }
   </style>
 </head>
 <body>
-  <h1>⚡ Config Guardian</h1>
-  <div class="status ${state.status}">
-    <div><strong>Status:</strong> ${state.status === "idle" ? "✅ All clear — no pending changes" : "⚠️ Changes pending confirmation"}</div>
-    ${state.status === "pending" ? `<div class="timer">${min}:${String(sec).padStart(2, "0")} remaining</div>` : ""}
-    ${state.changedFiles.length > 0 ? `<div class="files"><strong>Changed:</strong><br>${state.changedFiles.join("<br>")}</div>` : ""}
-  </div>
-  <div class="actions">
-    <form method="POST" action="/__guardian__/api/confirm" style="display:inline">
-      <button class="btn btn-confirm" ${state.status !== "pending" ? "disabled" : ""}>✓ Confirm Changes</button>
-    </form>
-    <form method="POST" action="/__guardian__/api/revert" style="display:inline">
-      <button class="btn btn-revert" ${state.status !== "pending" ? "disabled" : ""}>✗ Revert Changes</button>
-    </form>
+  <div class="wrap">
+    <div class="header">
+      <div class="logo">{}</div>
+      <div>
+        <h1>Config Guardian</h1>
+        <p>Safety net for OpenCode edits to your Home Assistant config.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <span class="badge ${isPending ? "pending" : "idle"}">
+        <span class="dot"></span>
+        ${isPending ? "Changes pending" : "All clear"}
+      </span>
+
+      ${
+        isPending
+          ? `<div class="timer ${remaining < 120000 ? "urgent" : ""}">${min}:${String(sec).padStart(2, "0")}</div>
+             <div class="timer-sub">until automatic revert</div>
+             ${
+               filesList
+                 ? `<div class="files">
+                      <div class="files-label">Files changed</div>
+                      <ul>${filesList}</ul>
+                    </div>`
+                 : ""
+             }
+             <div class="actions">
+               <form method="POST" action="${ingressPath}/__guardian__/api/confirm" style="flex:1">
+                 <button class="btn btn-confirm" type="submit">Confirm changes</button>
+               </form>
+               <form method="POST" action="${ingressPath}/__guardian__/api/revert" style="flex:1">
+                 <button class="btn btn-revert" type="submit">Revert</button>
+               </form>
+             </div>`
+          : `<div class="empty">
+               <div class="empty-emoji">✨</div>
+               <h2>No pending changes</h2>
+               <p>Your config is in a known-good state. Edits in OpenCode will appear here for confirmation.</p>
+             </div>`
+      }
+    </div>
+
+    <div class="footer">Auto-refreshes every 5 seconds</div>
   </div>
 </body>
 </html>`;
@@ -651,7 +804,7 @@ const server = http.createServer((req, res) => {
   // Guardian status page (fallback UI)
   if (pathname === "/__guardian__/" || pathname === "/__guardian__") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(getStatusPage());
+    res.end(getStatusPage(req));
     return;
   }
 

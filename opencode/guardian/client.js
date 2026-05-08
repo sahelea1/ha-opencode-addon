@@ -1,168 +1,198 @@
 /**
  * Config Guardian — Client Banner
  *
- * Injected into OpenCode's HTML by the proxy.
- * Polls the guardian API and shows a floating confirmation bar
- * when config changes are pending.
+ * Injected into OpenCode's HTML by the proxy. Polls the guardian API and
+ * shows a floating Material-3-style confirmation bar when config changes
+ * are pending.
  */
 (function () {
   "use strict";
 
-  // Resolve guardian API base URL — works with both direct access and HA ingress
-  var currentHref = window.location.href;
+  // Resolve guardian API base URL — works with both direct access and HA
+  // ingress (the runtime path patcher already prepends the prefix).
+  var currentHref = window.location.href.split("?")[0].split("#")[0];
   if (!currentHref.endsWith("/")) currentHref += "/";
   var API_BASE = new URL("__guardian__/api/", currentHref).href;
   var POLL_MS = 3000;
 
-  // ── Build the banner DOM ────────────────────────────────
+  // ── Inject styles (Material Design 3-ish) ───────────────────────────
   var style = document.createElement("style");
   style.textContent = [
-    "#gcfg-bar {",
-    "  position:fixed; top:0; left:0; right:0; z-index:2147483647;",
-    "  transform:translateY(-100%); opacity:0;",
-    "  transition:transform .35s cubic-bezier(.4,0,.2,1), opacity .35s;",
+    "#gcfg-bar{",
+    "  position:fixed;top:0;left:0;right:0;z-index:2147483647;",
+    "  display:flex;justify-content:center;",
+    "  transform:translateY(-110%);opacity:0;",
+    "  transition:transform .42s cubic-bezier(.2,0,0,1),opacity .3s;",
     "  pointer-events:none;",
-    "  font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;",
+    "  font:500 14px/1.3 'Inter','SF Pro Text',-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;",
+    "  -webkit-font-smoothing:antialiased;",
     "}",
-    "#gcfg-bar.visible { transform:translateY(0); opacity:1; pointer-events:auto; }",
-    "#gcfg-bar .gcfg-inner {",
-    "  display:flex; align-items:center; gap:14px;",
-    "  padding:9px 18px; margin:8px 12px 0;",
-    "  background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);",
-    "  border:1px solid rgba(233,69,96,.45); border-radius:10px;",
-    "  box-shadow:0 4px 24px rgba(0,0,0,.45),0 0 0 1px rgba(233,69,96,.1);",
-    "  color:#e2e8f0; font-size:13px; line-height:1.3;",
+    "#gcfg-bar.show{transform:translateY(0);opacity:1;pointer-events:auto;}",
+
+    "#gcfg-bar .gcfg-pill{",
+    "  display:flex;align-items:center;gap:14px;",
+    "  margin:12px 16px;padding:10px 14px 10px 18px;",
+    "  background:rgba(28,25,52,.94);",
+    "  -webkit-backdrop-filter:saturate(180%) blur(18px);",
+    "  backdrop-filter:saturate(180%) blur(18px);",
+    "  border:1px solid rgba(162,89,230,.32);",
+    "  border-radius:16px;",
+    "  box-shadow:",
+    "    0 1px 0 rgba(255,255,255,.04) inset,",
+    "    0 12px 32px rgba(15,12,40,.55),",
+    "    0 4px 12px rgba(89,78,234,.25);",
+    "  color:#e2e8f0;max-width:880px;width:calc(100% - 32px);",
     "}",
-    "#gcfg-bar.urgent .gcfg-inner {",
-    "  border-color:rgba(255,68,68,.7);",
-    "  animation:gcfgPulse 1.2s ease-in-out infinite alternate;",
+
+    "#gcfg-bar .gcfg-dot{",
+    "  flex-shrink:0;width:34px;height:34px;border-radius:11px;",
+    "  background:linear-gradient(135deg,#594EEA 0%,#7C5CEC 50%,#A259E6 100%);",
+    "  box-shadow:0 4px 12px rgba(124,92,236,.45);",
+    "  display:flex;align-items:center;justify-content:center;",
+    "  color:#fff;font:800 16px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;",
+    "  letter-spacing:-1px;",
     "}",
-    "@keyframes gcfgPulse {",
-    "  from { box-shadow:0 4px 24px rgba(0,0,0,.45),0 0 8px rgba(255,68,68,.15); }",
-    "  to   { box-shadow:0 4px 24px rgba(0,0,0,.45),0 0 18px rgba(255,68,68,.35); }",
+
+    "#gcfg-bar .gcfg-time{",
+    "  flex-shrink:0;font:700 22px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;",
+    "  color:#a78bfa;letter-spacing:.5px;font-variant-numeric:tabular-nums;",
+    "  min-width:62px;text-align:center;",
     "}",
-    "#gcfg-bar .gcfg-icon { font-size:18px; flex-shrink:0; }",
-    "#gcfg-bar .gcfg-timer {",
-    "  font-family:'SF Mono','Fira Code','Cascadia Code',monospace;",
-    "  font-size:20px; font-weight:700; min-width:54px;",
-    "  color:#e94560; letter-spacing:.5px;",
+    "#gcfg-bar.urgent .gcfg-time{color:#fb7185;}",
+
+    "#gcfg-bar .gcfg-text{flex:1;min-width:0;display:flex;flex-direction:column;}",
+    "#gcfg-bar .gcfg-title{font-weight:600;color:#f1f5f9;letter-spacing:-.01em;}",
+    "#gcfg-bar .gcfg-files{",
+    "  font-size:12px;color:#94a3b8;margin-top:2px;",
+    "  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;",
     "}",
-    "#gcfg-bar.urgent .gcfg-timer { color:#ff4444; }",
-    "#gcfg-bar .gcfg-label { font-weight:600; white-space:nowrap; }",
-    "#gcfg-bar .gcfg-files {",
-    "  flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;",
-    "  font-size:11px; color:#8b949e;",
+
+    "#gcfg-bar .gcfg-btn{",
+    "  flex-shrink:0;padding:8px 18px;border:0;border-radius:10px;",
+    "  font:600 13px/1 inherit;letter-spacing:.02em;cursor:pointer;",
+    "  transition:transform .12s,box-shadow .2s,filter .2s;",
+    "  display:inline-flex;align-items:center;gap:6px;",
     "}",
-    "#gcfg-bar .gcfg-btn {",
-    "  padding:5px 16px; border:none; border-radius:6px;",
-    "  font-size:12px; font-weight:700; cursor:pointer;",
-    "  font-family:inherit; letter-spacing:.3px;",
-    "  transition:filter .15s,transform .1s;",
-    "  text-transform:uppercase; flex-shrink:0;",
+    "#gcfg-bar .gcfg-btn:hover{filter:brightness(1.1);transform:translateY(-1px);}",
+    "#gcfg-bar .gcfg-btn:active{transform:translateY(0);filter:brightness(.95);}",
+    "#gcfg-bar .gcfg-btn:focus-visible{outline:2px solid #a78bfa;outline-offset:2px;}",
+    "#gcfg-bar .gcfg-confirm{",
+    "  background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;",
+    "  box-shadow:0 6px 16px rgba(34,197,94,.35);",
     "}",
-    "#gcfg-bar .gcfg-btn:hover { filter:brightness(1.2); transform:scale(1.03); }",
-    "#gcfg-bar .gcfg-btn:active { transform:scale(.97); }",
-    "#gcfg-bar .gcfg-confirm { background:#238636; color:#fff; }",
-    "#gcfg-bar .gcfg-revert  { background:#da3633; color:#fff; }",
+    "#gcfg-bar .gcfg-revert{",
+    "  background:rgba(244,63,94,.12);color:#fb7185;",
+    "  border:1px solid rgba(244,63,94,.4);",
+    "}",
+    "#gcfg-bar .gcfg-revert:hover{background:rgba(244,63,94,.22);}",
+
+    "#gcfg-bar.urgent .gcfg-pill{",
+    "  border-color:rgba(244,63,94,.55);",
+    "  animation:gcfgPulse 1.4s ease-in-out infinite alternate;",
+    "}",
+    "@keyframes gcfgPulse{",
+    "  from{box-shadow:0 12px 32px rgba(15,12,40,.55),0 0 0 rgba(244,63,94,.0);}",
+    "  to  {box-shadow:0 12px 32px rgba(15,12,40,.55),0 0 24px rgba(244,63,94,.45);}",
+    "}",
+
+    "#gcfg-toast{",
+    "  position:fixed;top:18px;left:50%;",
+    "  transform:translateX(-50%) translateY(-90px);",
+    "  z-index:2147483647;padding:11px 22px;border-radius:12px;",
+    "  font:600 13px/1 'Inter','SF Pro Text',system-ui,sans-serif;",
+    "  letter-spacing:.01em;color:#fff;opacity:0;pointer-events:none;",
+    "  transition:transform .42s cubic-bezier(.2,0,0,1),opacity .3s;",
+    "  box-shadow:0 12px 32px rgba(0,0,0,.35);",
+    "}",
+    "#gcfg-toast.show{transform:translateX(-50%) translateY(0);opacity:1;}",
+    "#gcfg-toast.success{background:linear-gradient(135deg,#22c55e,#16a34a);}",
+    "#gcfg-toast.reverted{background:linear-gradient(135deg,#f43f5e,#e11d48);}",
     "",
-    /* Slide body content down when bar is visible */
-    "#gcfg-bar.visible ~ *, #gcfg-bar.visible + * { /* handled via JS margin */ }",
-    "",
-    /* Success/revert toast */
-    "#gcfg-toast {",
-    "  position:fixed; top:12px; left:50%; transform:translateX(-50%) translateY(-80px);",
-    "  z-index:2147483647; padding:10px 24px; border-radius:8px;",
-    "  font-family:-apple-system,sans-serif; font-size:13px; font-weight:600;",
-    "  transition:transform .4s cubic-bezier(.4,0,.2,1), opacity .4s;",
-    "  opacity:0; pointer-events:none;",
+    "@media (max-width:640px){",
+    "  #gcfg-bar .gcfg-files{display:none;}",
+    "  #gcfg-bar .gcfg-pill{margin:8px 8px;padding:8px 10px 8px 12px;gap:10px;}",
     "}",
-    "#gcfg-toast.show { transform:translateX(-50%) translateY(0); opacity:1; }",
-    "#gcfg-toast.success { background:#238636; color:#fff; }",
-    "#gcfg-toast.reverted { background:#da3633; color:#fff; }",
   ].join("\n");
   document.head.appendChild(style);
 
+  // ── Build DOM ───────────────────────────────────────────────────────
   var bar = document.createElement("div");
   bar.id = "gcfg-bar";
   bar.innerHTML = [
-    '<div class="gcfg-inner">',
-    '  <span class="gcfg-icon">⚡</span>',
-    '  <span class="gcfg-timer">--:--</span>',
-    '  <span class="gcfg-label">Config changes pending</span>',
-    '  <span class="gcfg-files"></span>',
-    '  <button class="gcfg-btn gcfg-confirm" onclick="window.__gcfgConfirm()">✓ Confirm</button>',
-    '  <button class="gcfg-btn gcfg-revert" onclick="window.__gcfgRevert()">✗ Revert</button>',
+    '<div class="gcfg-pill" role="status" aria-live="polite">',
+    '  <div class="gcfg-dot">{}</div>',
+    '  <div class="gcfg-time" aria-label="time remaining">--:--</div>',
+    '  <div class="gcfg-text">',
+    '    <span class="gcfg-title">Config changes pending</span>',
+    '    <span class="gcfg-files"></span>',
+    "  </div>",
+    '  <button class="gcfg-btn gcfg-confirm" type="button">Confirm</button>',
+    '  <button class="gcfg-btn gcfg-revert"  type="button">Revert</button>',
     "</div>",
   ].join("\n");
   document.body.appendChild(bar);
+  bar.querySelector(".gcfg-confirm").addEventListener("click", function () {
+    window.__gcfgConfirm();
+  });
+  bar.querySelector(".gcfg-revert").addEventListener("click", function () {
+    window.__gcfgRevert();
+  });
 
   var toast = document.createElement("div");
   toast.id = "gcfg-toast";
   document.body.appendChild(toast);
 
-  // ── Helpers ─────────────────────────────────────────────
+  // ── Helpers ─────────────────────────────────────────────────────────
   function fmt(ms) {
     var total = Math.ceil(ms / 1000);
     var m = Math.floor(total / 60);
     var s = total % 60;
     return m + ":" + (s < 10 ? "0" : "") + s;
   }
-
   function showToast(text, cls) {
     toast.textContent = text;
     toast.className = cls + " show";
     setTimeout(function () {
       toast.className = "";
-    }, 3000);
+    }, 3200);
   }
 
-  // ── Poll loop ───────────────────────────────────────────
-  var lastStatus = "idle";
-
+  // ── Poll loop ───────────────────────────────────────────────────────
   function poll() {
     fetch(API_BASE + "status", { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d.status === "pending") {
-          bar.classList.add("visible");
-          bar.querySelector(".gcfg-timer").textContent = fmt(d.remainingMs);
+          bar.classList.add("show");
+          bar.querySelector(".gcfg-time").textContent = fmt(d.remainingMs);
+          var files = d.changedFiles || [];
           bar.querySelector(".gcfg-files").textContent =
-            d.changedFiles.length > 0
-              ? d.changedFiles.slice(0, 5).join("  ·  ")
-              : "";
-
-          if (d.remainingMs < 120000) {
-            bar.classList.add("urgent");
-          } else {
-            bar.classList.remove("urgent");
-          }
-          document.body.style.paddingTop = "54px";
+            files.length === 0
+              ? ""
+              : files.slice(0, 4).join("  ·  ") +
+                (files.length > 4 ? "  +" + (files.length - 4) + " more" : "");
+          if (d.remainingMs < 120000) bar.classList.add("urgent");
+          else bar.classList.remove("urgent");
+          document.body.style.paddingTop = "62px";
         } else {
-          bar.classList.remove("visible", "urgent");
+          bar.classList.remove("show", "urgent");
           document.body.style.paddingTop = "";
-
-          // Show toast when transitioning from pending to idle
-          if (lastStatus === "pending" && d.status === "idle") {
-            // toast already shown by confirm/revert action
-          }
         }
-        lastStatus = d.status;
       })
       .catch(function () {
-        // API unreachable — hide bar silently
-        bar.classList.remove("visible", "urgent");
+        bar.classList.remove("show", "urgent");
         document.body.style.paddingTop = "";
       });
   }
 
-  // ── Actions ─────────────────────────────────────────────
+  // ── Actions ─────────────────────────────────────────────────────────
   window.__gcfgConfirm = function () {
     fetch(API_BASE + "confirm", { method: "POST" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d.ok) {
-          showToast("✓ Changes confirmed", "success");
-          bar.classList.remove("visible", "urgent");
+          showToast("Changes confirmed", "success");
+          bar.classList.remove("show", "urgent");
           document.body.style.paddingTop = "";
         }
       })
@@ -171,19 +201,15 @@
   };
 
   window.__gcfgRevert = function () {
-    if (
-      !confirm(
-        "Revert all pending changes?\n\nThis restores the last confirmed config state and triggers a Home Assistant reload."
-      )
-    )
+    if (!confirm("Revert all pending changes?\n\nThis restores the last confirmed config and triggers a Home Assistant reload.")) {
       return;
-
+    }
     fetch(API_BASE + "revert", { method: "POST" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d.ok) {
-          showToast("✗ Changes reverted — HA reloading", "reverted");
-          bar.classList.remove("visible", "urgent");
+          showToast("Reverted — HA reloading", "reverted");
+          bar.classList.remove("show", "urgent");
           document.body.style.paddingTop = "";
         }
       })
@@ -191,7 +217,6 @@
     poll();
   };
 
-  // ── Start ───────────────────────────────────────────────
   setInterval(poll, POLL_MS);
   poll();
 })();

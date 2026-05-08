@@ -1,5 +1,5 @@
 name: "OpenCode"
-version: "1.1.0"
+version: "1.2.0"
 slug: "opencode"
 description: "AI coding agent with config safety guardian for Home Assistant"
 url: "https://opencode.ai"
