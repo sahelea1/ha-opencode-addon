@@ -2,7 +2,7 @@
 set -eo pipefail
 
 echo "========================================"
-echo "  OpenCode HA Add-on Starting"
+echo "  ha-opencode-addon Starting"
 echo "========================================"
 
 # ----------------------------------------------------------
@@ -52,18 +52,57 @@ export OPENCODE_DISABLE_AUTOUPDATE=true
 echo "[init] Persistent OpenCode storage linked under /data"
 
 # ----------------------------------------------------------
-# 2. Read add-on options — only the guardian timeout
+# 2. Read add-on options — provider preset/API keys + guardian timeout
 # ----------------------------------------------------------
 OPTIONS_FILE="/data/options.json"
+PROVIDER="anthropic"
+ANTHROPIC_KEY=""
+OPENAI_KEY=""
+OPENROUTER_KEY=""
+
 if [ -f "$OPTIONS_FILE" ]; then
+    PROVIDER=$(jq -r '.provider // "anthropic"' "$OPTIONS_FILE")
+    ANTHROPIC_KEY=$(jq -r '.ANTHROPIC_API_KEY // empty' "$OPTIONS_FILE")
+    OPENAI_KEY=$(jq -r '.OPENAI_API_KEY // empty' "$OPTIONS_FILE")
+    OPENROUTER_KEY=$(jq -r '.OPENROUTER_API_KEY // empty' "$OPTIONS_FILE")
     TIMEOUT_MIN=$(jq -r '.confirm_timeout_minutes // 10' "$OPTIONS_FILE")
+    [ -n "$ANTHROPIC_KEY" ] && export ANTHROPIC_API_KEY="$ANTHROPIC_KEY"
+    [ -n "$OPENAI_KEY" ] && export OPENAI_API_KEY="$OPENAI_KEY"
+    [ -n "$OPENROUTER_KEY" ] && export OPENROUTER_API_KEY="$OPENROUTER_KEY"
+    echo "[init] Provider preset: ${PROVIDER}"
     echo "[init] Confirm timeout: ${TIMEOUT_MIN} minutes"
 else
     TIMEOUT_MIN=10
-    echo "[init] No options file found, using default 10 minutes"
+    echo "[init] No options file found, using defaults"
 fi
 
 export GUARDIAN_TIMEOUT_MIN="$TIMEOUT_MIN"
+
+OC_CONFIG="/data/opencode-config/opencode.json"
+write_default_opencode_config() {
+    cat > "$OC_CONFIG" <<'EOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "anthropic": {},
+    "openai": {},
+    "openrouter": {}
+  }
+}
+EOF
+}
+
+if [ ! -f "$OC_CONFIG" ]; then
+    write_default_opencode_config
+    echo "[init] Created OpenCode provider preset config"
+elif jq -e '(.provider | type) == "string"' "$OC_CONFIG" >/dev/null 2>&1; then
+    LEGACY_PROVIDER=$(jq -r '.provider' "$OC_CONFIG")
+    cp "$OC_CONFIG" "${OC_CONFIG}.legacy.$(date +%s)"
+    TMP_CONFIG="${OC_CONFIG}.tmp"
+    jq 'del(.provider) + {provider: {anthropic: {}, openai: {}, openrouter: {}}}' "$OC_CONFIG" > "$TMP_CONFIG"
+    mv "$TMP_CONFIG" "$OC_CONFIG"
+    echo "[init] Migrated legacy OpenCode provider preset: ${LEGACY_PROVIDER}"
+fi
 
 # ----------------------------------------------------------
 # 3. Validate HA config mount and clean up legacy add-on git repo
@@ -79,6 +118,13 @@ if [ ! -w /config ]; then
 fi
 
 echo "[init] Home Assistant config mounted at /config"
+
+if [ -L /root/ha-config ] || [ ! -e /root/ha-config ]; then
+    ln -sfnT /config /root/ha-config
+    echo "[init] Home Assistant config mirrored at /root/ha-config"
+else
+    echo "[init] /root/ha-config exists and is not a symlink; leaving it untouched"
+fi
 
 # Versions before 1.3.0 created an empty git repo in /config. The guardian
 # uses rsync baselines, not git, so remove only that exact empty legacy repo to

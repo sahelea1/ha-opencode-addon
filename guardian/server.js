@@ -712,7 +712,7 @@ const LOADING_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>OpenCode — Starting</title>
+  <title>ha-opencode-addon — Starting</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="refresh" content="3">
   <style>
@@ -772,7 +772,7 @@ const LOADING_PAGE = `<!DOCTYPE html>
 <body>
   <div class="card">
     <div class="logo">{}</div>
-    <h1>Starting OpenCode</h1>
+    <h1>Starting ha-opencode-addon</h1>
     <p>This will refresh automatically once the server is ready.</p>
     <div class="progress" aria-hidden="true"></div>
   </div>
