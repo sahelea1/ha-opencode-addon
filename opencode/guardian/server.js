@@ -318,7 +318,7 @@ function startOpenCode() {
 
   opencodeProcess = spawn(
     "opencode",
-    ["web", "--hostname", "127.0.0.1", "--port", String(OPENCODE_PORT)],
+    ["serve", "--hostname", "127.0.0.1", "--port", String(OPENCODE_PORT)],
     {
       cwd: CONFIG_DIR,
       stdio: "inherit",
