@@ -1,11 +1,11 @@
-# OpenCode Home Assistant Add-on
+# ha-opencode-addon
 
 An AI coding agent for editing your Home Assistant configuration — with a **safety guardian** that automatically backs up config before every change and reverts if you don't confirm within 10 minutes.
 
 ## What it does
 
-- Runs [OpenCode](https://opencode.ai) web UI inside a Docker container on your HA instance
-- Mounts your entire `/config` directory (read/write) so OpenCode can edit your YAML files
+- Runs [OpenCode](https://opencode.ai) web UI inside a Docker container on your HA instance, rooted at your Home Assistant `/config` directory
+- Mounts your entire `/config` directory (read/write) and mirrors it at `/root/ha-config` so OpenCode can always see your HA files
 - **Config Guardian** monitors every file change and:
   1. Keeps a backup of the "last known good" config at all times
   2. When changes are detected, starts a 10-minute countdown
@@ -13,7 +13,7 @@ An AI coding agent for editing your Home Assistant configuration — with a **sa
   4. If you don't confirm in time → **auto-reverts** and reloads HA
   5. On crash → **auto-reverts** on next startup (failsafe)
 - No login required in the web UI — HA ingress handles authentication
-- API keys and OpenCode config persist across restarts
+- Provider presets/API keys, OpenCode logins, config, sessions, state, and cache persist across restarts
 
 ## Architecture
 
@@ -47,10 +47,10 @@ An AI coding agent for editing your Home Assistant configuration — with a **sa
 SSH into your HA and create the add-on directory:
 
 ```bash
-mkdir -p /addons/opencode-addon
+mkdir -p /addons/ha-opencode-addon
 ```
 
-Copy all files from this archive into `/addons/opencode-addon/`.
+Copy all files from this archive into `/addons/ha-opencode-addon/`.
 
 ### 2. Add the local repository
 
@@ -58,14 +58,13 @@ In HA: **Settings → Add-ons → Add-on Store → ⋮ (top right) → Repositor
 
 Add: `/addons`
 
-Hit refresh. "OpenCode" should appear under **Local add-ons**.
+Hit refresh. "ha-opencode-addon" should appear under **Local add-ons**.
 
 ### 3. Install and configure
 
-- Click **OpenCode** → **Install** (builds the Docker image, takes 2-3 minutes)
+- Click **ha-opencode-addon** → **Install** (builds the Docker image, takes 2-3 minutes)
 - Go to the **Configuration** tab
-- Enter your API key (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`)
-- Choose your `provider`
+- Choose a provider preset and optionally enter an API key
 - Optionally adjust `confirm_timeout_minutes` (default: 10)
 - Click **Start**
 
@@ -73,7 +72,7 @@ Hit refresh. "OpenCode" should appear under **Local add-ons**.
 
 Click **"Open Web UI"** on the add-on page. You'll see the OpenCode web interface.
 
-Start editing your HA config files through OpenCode. When changes are detected, a banner appears at the top:
+Start editing your HA config files through OpenCode. The UI opens with `/config` as the working directory, and the same files are mirrored at `/root/ha-config`. When changes are detected, a banner appears at the top:
 
 ```
 ⚡  9:42  Config changes pending  automations.yaml · configuration.yaml
@@ -121,14 +120,14 @@ Everything in `/config` **except**:
 | OpenCode auth/sessions | `/data/opencode-share/` | ✅ |
 | Config backup (last known good) | `/data/last-known-good/` | ✅ |
 | Guardian state | `/data/guardian-state.json` | ✅ |
-| Your HA config files | `/config/` (mapped) | ✅ |
+| Your HA config files | `/config/` mapped, `/root/ha-config` symlink | ✅ |
 
 ## Updating OpenCode
 
 Bump the `version` in `config.yaml` to trigger a rebuild:
 
 ```yaml
-version: "1.0.1"
+version: "1.4.0"
 ```
 
 Then **Rebuild** from the add-on page. Your `/data` (auth, config, backups) persists through rebuilds.

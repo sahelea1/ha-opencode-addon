@@ -8,11 +8,10 @@
 (function () {
   "use strict";
 
-  // Resolve guardian API base URL — works with both direct access and HA
-  // ingress (the runtime path patcher already prepends the prefix).
-  var currentHref = window.location.href.split("?")[0].split("#")[0];
-  if (!currentHref.endsWith("/")) currentHref += "/";
-  var API_BASE = new URL("__guardian__/api/", currentHref).href;
+  // Resolve guardian API base URL from the ingress root, not the current SPA
+  // route, so the buttons keep working after navigation inside OpenCode.
+  var ingressRoot = window.__GUARDIAN_BASE_PATH || "";
+  var API_BASE = ingressRoot + "/__guardian__/api/";
   var POLL_MS = 3000;
 
   // ── Inject styles (Material Design 3-ish) ───────────────────────────
