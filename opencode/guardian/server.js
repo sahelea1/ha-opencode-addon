@@ -314,7 +314,7 @@ let opencodeProcess = null;
 let opencodeReady = false;
 
 function startOpenCode() {
-  console.log("[guardian] Starting OpenCode web on 127.0.0.1:%d ...", OPENCODE_PORT);
+  console.log("[guardian] Starting OpenCode server on 127.0.0.1:%d ...", OPENCODE_PORT);
 
   opencodeProcess = spawn(
     "opencode",
@@ -366,9 +366,12 @@ const proxy = httpProxy.createProxyServer({
   ws: true,
 });
 
-// Strip accept-encoding so we get uncompressed HTML to inject into
-proxy.on("proxyReq", (proxyReq) => {
+// Strip accept-encoding so we receive uncompressed HTML to inject into.
+// Forward X-Ingress-Path so OpenCode can optionally use it.
+proxy.on("proxyReq", (proxyReq, req) => {
   proxyReq.removeHeader("accept-encoding");
+  const ip = req.headers["x-ingress-path"];
+  if (ip) proxyReq.setHeader("x-ingress-path", ip);
 });
 
 // Handle proxied responses — inject guardian script into HTML
@@ -376,29 +379,97 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
   const contentType = proxyRes.headers["content-type"] || "";
 
   if (contentType.includes("text/html")) {
-    // Buffer HTML response, inject guardian client script
     const chunks = [];
     proxyRes.on("data", (chunk) => chunks.push(chunk));
     proxyRes.on("end", () => {
       let body = Buffer.concat(chunks).toString("utf8");
 
-      // Inject the guardian client script
-      const injection = `<script>\n${CLIENT_SCRIPT}\n</script>`;
-      if (body.includes("</head>")) {
-        body = body.replace("</head>", `${injection}\n</head>`);
-      } else if (body.includes("</body>")) {
-        body = body.replace("</body>", `${injection}\n</body>`);
-      } else {
-        body += injection;
+      // ── HA Ingress path fix ────────────────────────────────────────
+      // HA proxies the add-on under a path prefix such as
+      //   /api/hassio_ingress/TOKEN/
+      // but strips that prefix before forwarding requests to us, so
+      // OpenCode sees normal paths.  The browser however still uses the
+      // full HA URL, meaning absolute paths like src="/assets/app.js"
+      // resolve to HA's own root and the app never loads (blank page).
+      //
+      // Fix in three layers:
+      //   1. <base href="…"> — makes RELATIVE paths resolve correctly
+      //   2. Attribute regex — rewrites absolute paths already in the HTML
+      //   3. JS runtime patch — intercepts fetch / XHR / WebSocket calls
+      //      that construct absolute paths dynamically
+      const ingressPath = (req.headers["x-ingress-path"] || "").replace(/\/$/, "");
+
+      // Layer 2: rewrite absolute src/href/action attributes in the raw HTML
+      if (ingressPath) {
+        body = body.replace(
+          /((?:src|href|action|data-src)=["'])(\/(?!\/))/g,
+          `$1${ingressPath}/`
+        );
       }
 
-      // Forward modified response
+      // Layer 1 + 3: inject <base> and the runtime JS patcher + guardian banner
+      const baseHref = ingressPath ? `${ingressPath}/` : "/";
+      const injection = `<base href="${baseHref}">
+<script>
+/* ── HA Ingress runtime path patcher ── */
+(function () {
+  var _ip = ${JSON.stringify(ingressPath)};
+  if (!_ip) return;
+  function fixPath(u) {
+    if (typeof u !== "string") return u;
+    if (u.charAt(0) === "/" && u.slice(0, _ip.length) !== _ip) return _ip + u;
+    return u;
+  }
+  /* fetch */
+  var _fetch = window.fetch;
+  window.fetch = function (resource, init) {
+    return _fetch.call(this, typeof resource === "string" ? fixPath(resource) : resource, init);
+  };
+  /* XMLHttpRequest */
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    arguments[1] = fixPath(url);
+    return _open.apply(this, arguments);
+  };
+  /* WebSocket — rewrite the pathname portion only */
+  var _WS = window.WebSocket;
+  function PatchedWS(url, protocols) {
+    if (typeof url === "string") {
+      try {
+        var u = new URL(url);
+        if (u.pathname.charAt(0) === "/" && u.pathname.slice(0, _ip.length) !== _ip) {
+          u.pathname = _ip + u.pathname;
+          url = u.toString();
+        }
+      } catch (e) {}
+    }
+    return protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
+  }
+  PatchedWS.prototype = _WS.prototype;
+  PatchedWS.CONNECTING = _WS.CONNECTING;
+  PatchedWS.OPEN      = _WS.OPEN;
+  PatchedWS.CLOSING   = _WS.CLOSING;
+  PatchedWS.CLOSED    = _WS.CLOSED;
+  window.WebSocket = PatchedWS;
+})();
+/* ── Guardian banner ── */
+${CLIENT_SCRIPT}
+</script>`;
+
+      if (body.includes("<head>")) {
+        body = body.replace("<head>", "<head>\n" + injection);
+      } else if (body.includes("</head>")) {
+        body = body.replace("</head>", injection + "\n</head>");
+      } else {
+        body = injection + body;
+      }
+
       const headers = Object.assign({}, proxyRes.headers);
       headers["content-length"] = Buffer.byteLength(body);
       delete headers["content-encoding"];
-      // Remove CSP that might block injected inline script
       delete headers["content-security-policy"];
       delete headers["content-security-policy-report-only"];
+      delete headers["x-frame-options"]; // allow embedding in HA iframe panels
 
       res.writeHead(proxyRes.statusCode, headers);
       res.end(body);
