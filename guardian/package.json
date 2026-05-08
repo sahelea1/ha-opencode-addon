@@ -1,0 +1,10 @@
+{
+  "name": "opencode-guardian",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Config safety guardian for OpenCode HA add-on",
+  "main": "server.js",
+  "dependencies": {
+    "http-proxy": "^1.18.1"
+  }
+}
