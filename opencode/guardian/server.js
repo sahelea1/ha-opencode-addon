@@ -454,39 +454,158 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
 (function () {
   var _ip = ${JSON.stringify(ingressPath)};
   if (!_ip) return;
-  function fixPath(u) {
-    if (typeof u !== "string") return u;
-    if (u.charAt(0) === "/" && u.slice(0, _ip.length) !== _ip) return _ip + u;
-    return u;
+  var _origin = window.location.origin;
+  var _wsHost = window.location.host;
+
+  // Returns the rewritten URL string if rewriting is needed, else null.
+  // Handles: relative paths, root-absolute paths, and same-origin absolute URLs.
+  function rewriteHttpUrl(input) {
+    if (typeof input !== "string") return null;
+    try {
+      // Fast path: root-absolute path that doesn't already have the prefix.
+      if (input.charAt(0) === "/" && input.charAt(1) !== "/") {
+        if (input.slice(0, _ip.length) !== _ip) return _ip + input;
+        return null;
+      }
+      // Otherwise: try to parse as URL (relative or absolute).
+      var u = new URL(input, _origin);
+      if (u.origin === _origin && u.pathname.slice(0, _ip.length) !== _ip) {
+        u.pathname = _ip + u.pathname;
+        return u.toString();
+      }
+    } catch (e) {}
+    return null;
   }
+
+  function rewriteWsUrl(input) {
+    if (typeof input !== "string") return null;
+    try {
+      var u = new URL(input);
+      if (u.host === _wsHost && u.pathname.slice(0, _ip.length) !== _ip) {
+        u.pathname = _ip + u.pathname;
+        return u.toString();
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // ---- fetch ---------------------------------------------------------------
   var _fetch = window.fetch;
   window.fetch = function (resource, init) {
-    return _fetch.call(this, typeof resource === "string" ? fixPath(resource) : resource, init);
+    try {
+      // Request object: rebuild with rewritten URL.
+      if (typeof Request !== "undefined" && resource instanceof Request) {
+        var newUrl = rewriteHttpUrl(resource.url);
+        if (newUrl) {
+          var hasBody = resource.method !== "GET" && resource.method !== "HEAD";
+          var initFromReq = {
+            method: resource.method,
+            headers: resource.headers,
+            mode: resource.mode === "navigate" ? "same-origin" : resource.mode,
+            credentials: resource.credentials,
+            cache: resource.cache,
+            redirect: resource.redirect,
+            referrer: resource.referrer,
+            integrity: resource.integrity,
+            keepalive: resource.keepalive,
+            signal: resource.signal,
+          };
+          if (hasBody) {
+            // Materialize body to ArrayBuffer to avoid streaming-body pitfalls.
+            return resource.clone().arrayBuffer().then(function (buf) {
+              if (buf && buf.byteLength > 0) initFromReq.body = buf;
+              if (init) Object.assign(initFromReq, init);
+              return _fetch.call(window, newUrl, initFromReq);
+            });
+          }
+          if (init) Object.assign(initFromReq, init);
+          return _fetch.call(this, newUrl, initFromReq);
+        }
+        return _fetch.call(this, resource, init);
+      }
+
+      // String URL.
+      if (typeof resource === "string") {
+        var s = rewriteHttpUrl(resource);
+        if (s !== null) resource = s;
+        return _fetch.call(this, resource, init);
+      }
+
+      // URL object.
+      if (resource && typeof resource.href === "string") {
+        var s2 = rewriteHttpUrl(resource.href);
+        if (s2 !== null) return _fetch.call(this, s2, init);
+      }
+    } catch (e) {}
+    return _fetch.call(this, resource, init);
   };
+
+  // ---- XMLHttpRequest ------------------------------------------------------
   var _open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
-    arguments[1] = fixPath(url);
+    if (typeof url === "string") {
+      var s = rewriteHttpUrl(url);
+      if (s !== null) arguments[1] = s;
+    } else if (url && typeof url.href === "string") {
+      var s2 = rewriteHttpUrl(url.href);
+      if (s2 !== null) arguments[1] = s2;
+    }
     return _open.apply(this, arguments);
   };
+
+  // ---- WebSocket -----------------------------------------------------------
   var _WS = window.WebSocket;
   function PatchedWS(url, protocols) {
     if (typeof url === "string") {
-      try {
-        var u = new URL(url);
-        if (u.pathname.charAt(0) === "/" && u.pathname.slice(0, _ip.length) !== _ip) {
-          u.pathname = _ip + u.pathname;
-          url = u.toString();
-        }
-      } catch (e) {}
+      var s = rewriteWsUrl(url);
+      if (s !== null) url = s;
+    } else if (url && typeof url.href === "string") {
+      var s2 = rewriteWsUrl(url.href);
+      if (s2 !== null) url = s2;
     }
     return protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
   }
   PatchedWS.prototype = _WS.prototype;
   PatchedWS.CONNECTING = _WS.CONNECTING;
-  PatchedWS.OPEN      = _WS.OPEN;
-  PatchedWS.CLOSING   = _WS.CLOSING;
-  PatchedWS.CLOSED    = _WS.CLOSED;
+  PatchedWS.OPEN       = _WS.OPEN;
+  PatchedWS.CLOSING    = _WS.CLOSING;
+  PatchedWS.CLOSED     = _WS.CLOSED;
   window.WebSocket = PatchedWS;
+
+  // ---- EventSource (defensive) --------------------------------------------
+  if (typeof window.EventSource === "function") {
+    var _ES = window.EventSource;
+    function PatchedES(url, init) {
+      if (typeof url === "string") {
+        var s = rewriteHttpUrl(url);
+        if (s !== null) url = s;
+      } else if (url && typeof url.href === "string") {
+        var s2 = rewriteHttpUrl(url.href);
+        if (s2 !== null) url = s2;
+      }
+      return init !== undefined ? new _ES(url, init) : new _ES(url);
+    }
+    PatchedES.prototype  = _ES.prototype;
+    PatchedES.CONNECTING = _ES.CONNECTING;
+    PatchedES.OPEN       = _ES.OPEN;
+    PatchedES.CLOSED     = _ES.CLOSED;
+    window.EventSource = PatchedES;
+  }
+
+  // ---- navigator.sendBeacon (defensive) -----------------------------------
+  if (navigator && typeof navigator.sendBeacon === "function") {
+    var _sb = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      if (typeof url === "string") {
+        var s = rewriteHttpUrl(url);
+        if (s !== null) url = s;
+      } else if (url && typeof url.href === "string") {
+        var s2 = rewriteHttpUrl(url.href);
+        if (s2 !== null) url = s2;
+      }
+      return _sb(url, data);
+    };
+  }
 })();
 ${CLIENT_SCRIPT}
 </script>`;
