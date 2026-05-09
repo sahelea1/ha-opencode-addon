@@ -1,5 +1,5 @@
 name: "ha-opencode-addon"
-version: "1.4.0"
+version: "1.7.0"
 slug: "opencode"
 description: "OpenCode web UI with config safety guardian for Home Assistant"
 url: "https://github.com/sahelea1/ha-opencode-addon"
@@ -33,17 +33,11 @@ ports:
 ports_description:
   8099/tcp: "OpenCode Web UI (direct access)"
 
-# Provider presets/API keys are optional convenience settings. You can also
-# connect providers from the OpenCode web UI; both paths persist in /data.
+# Provider, API keys, and login are entered interactively in the OpenCode
+# web UI; they persist in /data/opencode-config and /data/opencode-share
+# (symlinked into ~/.config/opencode and ~/.local/share/opencode), so they
+# survive add-on restarts and rebuilds.
 options:
-  provider: "anthropic"
-  ANTHROPIC_API_KEY: ""
-  OPENAI_API_KEY: ""
-  OPENROUTER_API_KEY: ""
   confirm_timeout_minutes: 10
 schema:
-  provider: "list(anthropic|openai|openrouter)?"
-  ANTHROPIC_API_KEY: "str?"
-  OPENAI_API_KEY: "str?"
-  OPENROUTER_API_KEY: "str?"
   confirm_timeout_minutes: "int(1,60)?"

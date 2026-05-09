@@ -52,57 +52,23 @@ export OPENCODE_DISABLE_AUTOUPDATE=true
 echo "[init] Persistent OpenCode storage linked under /data"
 
 # ----------------------------------------------------------
-# 2. Read add-on options — provider preset/API keys + guardian timeout
+# 2. Read add-on options — only the guardian timeout
 # ----------------------------------------------------------
 OPTIONS_FILE="/data/options.json"
-PROVIDER="anthropic"
-ANTHROPIC_KEY=""
-OPENAI_KEY=""
-OPENROUTER_KEY=""
-
 if [ -f "$OPTIONS_FILE" ]; then
-    PROVIDER=$(jq -r '.provider // "anthropic"' "$OPTIONS_FILE")
-    ANTHROPIC_KEY=$(jq -r '.ANTHROPIC_API_KEY // empty' "$OPTIONS_FILE")
-    OPENAI_KEY=$(jq -r '.OPENAI_API_KEY // empty' "$OPTIONS_FILE")
-    OPENROUTER_KEY=$(jq -r '.OPENROUTER_API_KEY // empty' "$OPTIONS_FILE")
     TIMEOUT_MIN=$(jq -r '.confirm_timeout_minutes // 10' "$OPTIONS_FILE")
-    [ -n "$ANTHROPIC_KEY" ] && export ANTHROPIC_API_KEY="$ANTHROPIC_KEY"
-    [ -n "$OPENAI_KEY" ] && export OPENAI_API_KEY="$OPENAI_KEY"
-    [ -n "$OPENROUTER_KEY" ] && export OPENROUTER_API_KEY="$OPENROUTER_KEY"
-    echo "[init] Provider preset: ${PROVIDER}"
     echo "[init] Confirm timeout: ${TIMEOUT_MIN} minutes"
 else
     TIMEOUT_MIN=10
-    echo "[init] No options file found, using defaults"
+    echo "[init] No options file found, using default 10 minutes"
 fi
 
 export GUARDIAN_TIMEOUT_MIN="$TIMEOUT_MIN"
 
-OC_CONFIG="/data/opencode-config/opencode.json"
-write_default_opencode_config() {
-    cat > "$OC_CONFIG" <<'EOF'
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "anthropic": {},
-    "openai": {},
-    "openrouter": {}
-  }
-}
-EOF
-}
-
-if [ ! -f "$OC_CONFIG" ]; then
-    write_default_opencode_config
-    echo "[init] Created OpenCode provider preset config"
-elif jq -e '(.provider | type) == "string"' "$OC_CONFIG" >/dev/null 2>&1; then
-    LEGACY_PROVIDER=$(jq -r '.provider' "$OC_CONFIG")
-    cp "$OC_CONFIG" "${OC_CONFIG}.legacy.$(date +%s)"
-    TMP_CONFIG="${OC_CONFIG}.tmp"
-    jq 'del(.provider) + {provider: {anthropic: {}, openai: {}, openrouter: {}}}' "$OC_CONFIG" > "$TMP_CONFIG"
-    mv "$TMP_CONFIG" "$OC_CONFIG"
-    echo "[init] Migrated legacy OpenCode provider preset: ${LEGACY_PROVIDER}"
-fi
+# OpenCode ships with its own built-in provider/login presets. We don't
+# write a custom opencode.json — users pick providers and log in through
+# the web UI, and credentials persist under /data/opencode-config and
+# /data/opencode-share via the symlinks created above.
 
 # ----------------------------------------------------------
 # 3. Validate HA config mount and clean up legacy add-on git repo
@@ -143,6 +109,15 @@ if [ -d /config/.git ]; then
     else
         echo "[init] Existing /config git repo preserved"
     fi
+else
+    # No git repo — initialize one so OpenCode recognizes /config as a project
+    cd /config
+    git init --quiet
+    git config user.email "opencode-addon@homeassistant"
+    git config user.name "OpenCode Addon"
+    git add -A >/dev/null 2>&1 || true
+    git commit -m "HA config baseline" --quiet 2>/dev/null || true
+    echo "[init] Initialized git repo in /config for OpenCode project detection"
 fi
 
 # ----------------------------------------------------------

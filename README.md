@@ -64,12 +64,9 @@ Hit refresh. "ha-opencode-addon" should appear under **Local add-ons**.
 
 - Click **ha-opencode-addon** → **Install** (builds the Docker image, takes 2-3 minutes)
 - Go to the **Configuration** tab
-- Choose a provider preset and optionally enter an API key
 - Optionally adjust `confirm_timeout_minutes` (default: 10)
 - Click **Start**
-- Open the web UI and connect your provider or API key inside OpenCode if you did not enter one in the add-on options
-
-Provider settings can be entered either in Home Assistant add-on options or in the OpenCode UI. Runtime OpenCode auth and config are stored in `/data/opencode-*`, which is Home Assistant add-on data.
+- Open the web UI and log in to your provider (anthropic, openai, openrouter) inside OpenCode — provider logins persist across restarts
 
 ### 4. Use it
 
