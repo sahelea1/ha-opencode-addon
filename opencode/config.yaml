@@ -1,5 +1,5 @@
 name: "ha-opencode-addon"
-version: "1.15.0"
+version: "1.16.0"
 slug: "opencode"
 description: "OpenCode web UI with config safety guardian for Home Assistant"
 url: "https://github.com/sahelea1/ha-opencode-addon"

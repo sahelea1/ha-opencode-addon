@@ -2,7 +2,7 @@
 set -eo pipefail
 
 echo "========================================"
-echo "  ha-opencode-addon v1.15 — workspace mode"
+echo "  ha-opencode-addon v1.16 — workspace + project pre-seed"
 echo "========================================"
 
 # ----------------------------------------------------------

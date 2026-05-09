@@ -590,6 +590,39 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
       const injection = `<base href="${baseHref}">
 <script>
 window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
+window.__GUARDIAN_WORKSPACE = ${JSON.stringify(WORKSPACE_DIR)};
+
+// Project pre-seed: opencode's SPA tracks "open projects" client-side
+// (separate from the server's /project endpoint) and shows a "No projects
+// open / Open project" empty-state on a fresh browser even when the
+// server reports the cwd as a registered project. Seed the localStorage
+// entry the SPA writes when a user clicks a project, so the workspace
+// opens automatically. The server key is hardcoded "local" for the
+// built-in default server. Idempotent: only fires on first ever load.
+(function () {
+  try {
+    if (localStorage.getItem("__guardian_project_seeded_v1")) return;
+    var KEY = "opencode.global.dat:server";
+    var WORKTREE = window.__GUARDIAN_WORKSPACE;
+    var SERVER = "local";
+    var current = null;
+    try { current = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) {}
+    if (!current || typeof current !== "object") current = {};
+    current.list = current.list || [];
+    current.projects = current.projects || {};
+    current.lastProject = current.lastProject || {};
+    var arr = current.projects[SERVER] || [];
+    if (!arr.find(function (p) { return p && p.worktree === WORKTREE; })) {
+      arr.unshift({ worktree: WORKTREE, expanded: true });
+      current.projects[SERVER] = arr;
+    }
+    if (!current.lastProject[SERVER]) {
+      current.lastProject[SERVER] = WORKTREE;
+    }
+    localStorage.setItem(KEY, JSON.stringify(current));
+    localStorage.setItem("__guardian_project_seeded_v1", "1");
+  } catch (e) {}
+})();
 
 // Layout pre-seed: the SPA's stored default sets the file-tree panel to
 // closed and the "changes" tab. Override once per browser so first load

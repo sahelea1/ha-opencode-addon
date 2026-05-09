@@ -8,7 +8,7 @@
  *   - pending:         changes were Apply'd to /config; user must Confirm or
  *                      Revert before the timer expires
  */
-(function () {
+function __gcfgInit() {
   "use strict";
 
   var ingressRoot = window.__GUARDIAN_BASE_PATH || "";
@@ -279,4 +279,12 @@
 
   setInterval(poll, POLL_MS);
   poll();
-})();
+}
+
+// The injected script runs in <head>, before <body> exists. Defer DOM
+// construction until the document body is ready.
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", __gcfgInit, { once: true });
+} else {
+  __gcfgInit();
+}
