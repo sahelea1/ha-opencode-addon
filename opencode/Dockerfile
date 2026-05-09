@@ -33,7 +33,7 @@ COPY run.sh /run.sh
 RUN chmod +x /run.sh
 
 LABEL \
-    io.hass.version="1.11.0" \
+    io.hass.version="1.13.0" \
     io.hass.type="addon" \
     io.hass.arch="aarch64|amd64"
 

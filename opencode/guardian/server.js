@@ -384,7 +384,55 @@ function startOpenCode() {
     setTimeout(startOpenCode, 5000);
   });
 
-  const readyCheck = setInterval(() => {
+  const readyCheck = startReadyCheck();
+}
+
+function ensureStarterSession() {
+  // On a fresh install the SPA's session list is empty and the user lands on
+  // a blank screen. Pre-create a session so they can start chatting in /config
+  // immediately. Idempotent: only fires when GET /session returns [].
+  const get = http.get(
+    `http://127.0.0.1:${OPENCODE_PORT}/session`,
+    { timeout: 3000 },
+    (res) => {
+      let buf = "";
+      res.on("data", (c) => (buf += c));
+      res.on("end", () => {
+        let arr;
+        try { arr = JSON.parse(buf); } catch (e) { return; }
+        if (!Array.isArray(arr) || arr.length > 0) return;
+        const post = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: OPENCODE_PORT,
+            path: "/session",
+            method: "POST",
+            headers: { "content-type": "application/json", "content-length": 2 },
+            timeout: 5000,
+          },
+          (r) => {
+            r.resume();
+            if (r.statusCode >= 200 && r.statusCode < 300) {
+              console.log("[guardian] Created starter session for /config");
+            } else {
+              console.log("[guardian] Starter session POST returned status " + r.statusCode);
+            }
+          }
+        );
+        post.on("error", (e) =>
+          console.error("[guardian] Starter session error:", e.message)
+        );
+        post.write("{}");
+        post.end();
+      });
+    }
+  );
+  get.on("error", () => {});
+  get.on("timeout", () => get.destroy());
+}
+
+function startReadyCheck() {
+  const handle = setInterval(() => {
     const req = http.get(
       `http://127.0.0.1:${OPENCODE_PORT}/`,
       { timeout: 2000 },
@@ -392,7 +440,8 @@ function startOpenCode() {
         if (res.statusCode < 500) {
           opencodeReady = true;
           console.log("[guardian] OpenCode is ready");
-          clearInterval(readyCheck);
+          clearInterval(handle);
+          ensureStarterSession();
         }
         res.resume();
       }
@@ -400,6 +449,7 @@ function startOpenCode() {
     req.on("error", () => {});
     req.on("timeout", () => req.destroy());
   }, 2000);
+  return handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +501,34 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
       const injection = `<base href="${baseHref}">
 <script>
 window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
+
+// Layout pre-seed: the SPA's stored default sets the file-tree panel to
+// closed and the "changes" tab. Since /config isn't a git repo, "changes"
+// is empty and the panel looks blank. Override once per browser so first
+// load shows the full file tree.
+(function () {
+  try {
+    if (localStorage.getItem("__guardian_seeded_v1")) return;
+    var current = null;
+    try { current = JSON.parse(localStorage.getItem("layout") || "null"); } catch (e) {}
+    var needsFix =
+      !current ||
+      !current.fileTree ||
+      current.fileTree.opened === false ||
+      current.fileTree.tab === "changes";
+    if (needsFix) {
+      var merged = current && typeof current === "object" ? current : {};
+      merged.fileTree = Object.assign({ width: 280 }, merged.fileTree || {}, {
+        opened: true,
+        tab: "all",
+      });
+      if (!merged.sidebar) merged.sidebar = { opened: true };
+      localStorage.setItem("layout", JSON.stringify(merged));
+    }
+    localStorage.setItem("__guardian_seeded_v1", "1");
+  } catch (e) {}
+})();
+
 (function () {
   var _ip = ${JSON.stringify(ingressPath)};
   if (!_ip) return;
