@@ -122,13 +122,11 @@ The guardian does not use git for approval/reset. Versions before 1.3.0 created 
 
 | Data | Location | Survives restart? |
 |---|---|---|
-| OpenCode settings | `/data/opencode-config/` | ✅ |
-| OpenCode auth/sessions | `/data/opencode-share/` | ✅ |
-| OpenCode state | `/data/opencode-state/` | ✅ |
-| OpenCode cache | `/data/opencode-cache/` | ✅ |
+| OpenCode settings | `/data/oc-v3/config/` | ✅ |
+| OpenCode auth/sessions | `/data/oc-v3/share/` | ✅ |
 | Config backup (last known good) | `/data/last-known-good/` | ✅ |
 | Guardian state | `/data/guardian-state.json` | ✅ |
-| Your HA config files | `/config/` mapped, `/root/ha-config` symlink | ✅ |
+| Your HA config files | `/config/` mapped | ✅ |
 
 ## Updating OpenCode
 

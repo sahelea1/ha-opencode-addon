@@ -382,7 +382,7 @@ function startOpenCode() {
   // container and previously caused the UI to come up in an empty
   // state. Persistence (auth, projects, sessions) lives under
   // ~/.local/share/opencode + ~/.config/opencode, which run.sh has
-  // symlinked into /data/oc-v2 already, so there is nothing to set
+  // symlinked into /data/oc-v3 already, so there is nothing to set
   // here beyond inheriting the shell environment.
   opencodeProcess = spawn(
     "opencode",
