@@ -1,5 +1,5 @@
 name: "ha-opencode-addon"
-version: "1.10.0"
+version: "1.11.0"
 slug: "opencode"
 description: "OpenCode web UI with config safety guardian for Home Assistant"
 url: "https://github.com/sahelea1/ha-opencode-addon"
@@ -11,35 +11,37 @@ arch:
 startup: application
 boot: auto
 
-# We run Node directly as PID 1 — no s6-overlay
+# Node runs directly as PID 1 — no s6-overlay
 init: false
 
-# Access to HA Supervisor API (for reload/restart)
+# HA Supervisor API access — used to reload/restart HA after a revert
 hassio_api: true
 homeassistant_api: true
 
-# Ingress — embeds web UI in HA sidebar, auth handled by HA.
-# ingress_stream is required so chunked / SSE responses (chat
+# Ingress — embeds the web UI in HA's sidebar; HA handles auth.
+# `ingress_stream` is required so SSE / chunked responses (chat
 # streaming, long-poll endpoints) flow through HA's ingress proxy.
 ingress: true
 ingress_port: 8099
 ingress_stream: true
 panel_icon: "mdi:code-braces"
 
-# Mount HA config directory read/write
+# Mount HA's /config read/write so OpenCode can edit YAML files.
 map:
   - config:rw
 
-# Direct port access (disabled by default, user can enable)
+# Direct port access (disabled by default — HA users normally use
+# the ingress panel). The user can enable this in the add-on's
+# Network tab if they want to hit it directly.
 ports:
   8099/tcp: null
 ports_description:
   8099/tcp: "OpenCode Web UI (direct access)"
 
-# Provider, API keys, and login are entered interactively in the OpenCode
-# web UI; they persist in /data/oc-v3/{config,share} (symlinked into
-# ~/.config/opencode and ~/.local/share/opencode) so they survive add-on
-# restarts and rebuilds.
+# Provider, API keys, and login are entered interactively inside
+# the OpenCode web UI — they persist in /data/oc-v3/{config,share}
+# (symlinked into ~/.config/opencode and ~/.local/share/opencode)
+# so they survive add-on restarts and rebuilds.
 options:
   confirm_timeout_minutes: 10
 schema:

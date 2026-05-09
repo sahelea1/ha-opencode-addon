@@ -1,11 +1,12 @@
 FROM node:20-slim
 
-# System dependencies
-# - git: required by OpenCode for file snapshots/undo
-# - rsync: for efficient config backup/restore
-# - jq: for parsing add-on options JSON
-# - curl + ca-certificates: HTTPS to opencode.ai installer
-# - unzip: the OpenCode installer extracts a release zip
+# Debian (glibc) — the upstream OpenCode binary is glibc-only, so we
+# can't use alpine here.
+#
+# - rsync: backup/restore /config <-> /data/last-known-good
+# - jq:    parse /data/options.json
+# - curl + ca-certificates + unzip: the OpenCode installer script
+#   downloads + unpacks the platform binary from GitHub releases
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     rsync \
@@ -15,28 +16,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenCode using the official installer.
-# It downloads the prebuilt platform binary directly from GitHub
-# releases, avoiding the broken npm postinstall path.
+# Install OpenCode using the official installer (drops binary into
+# /root/.opencode/bin). Using `npm install -g opencode-ai` was unreliable
+# because its postinstall didn't always land the platform binary.
 RUN curl -fsSL https://opencode.ai/install | bash
-
-# Installer drops the binary into ~/.opencode/bin — make it discoverable.
 ENV PATH="/root/.opencode/bin:${PATH}"
 
-# Install guardian dependencies
+# Guardian dependencies
 WORKDIR /opt/guardian
 COPY guardian/package.json ./
 RUN npm install --production
 
-# Copy guardian application
 COPY guardian/ ./
 
-# Copy startup script
 COPY run.sh /run.sh
 RUN chmod +x /run.sh
 
 LABEL \
-    io.hass.version="1.10.0" \
+    io.hass.version="1.11.0" \
     io.hass.type="addon" \
     io.hass.arch="aarch64|amd64"
 
