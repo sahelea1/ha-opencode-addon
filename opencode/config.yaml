@@ -1,5 +1,5 @@
 name: "ha-opencode-addon"
-version: "1.8.0"
+version: "1.9.0"
 slug: "opencode"
 description: "OpenCode web UI with config safety guardian for Home Assistant"
 url: "https://github.com/sahelea1/ha-opencode-addon"
@@ -34,9 +34,9 @@ ports_description:
   8099/tcp: "OpenCode Web UI (direct access)"
 
 # Provider, API keys, and login are entered interactively in the OpenCode
-# web UI; they persist in /data/oc-v2/{config,share,state,cache}
-# (symlinked into ~/.config/opencode, ~/.local/share/opencode, etc.) so
-# they survive add-on restarts and rebuilds.
+# web UI; they persist in /data/oc-v2/{config,share} (symlinked into
+# ~/.config/opencode and ~/.local/share/opencode) so they survive add-on
+# restarts and rebuilds.
 options:
   confirm_timeout_minutes: 10
 schema:

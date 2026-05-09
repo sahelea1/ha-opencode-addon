@@ -104,31 +104,87 @@ function getConfigHash() {
 
 // ---------------------------------------------------------------------------
 // Backup / Restore
+//
+// SAFETY: restore must NEVER use `--delete` against /config. A partial
+// or stale backup combined with `--delete` would wipe the user's HA
+// configuration. We only copy files (so missing-from-config files come
+// back, modified files revert) and we sanity-check the backup before
+// touching /config at all.
 // ---------------------------------------------------------------------------
+function countFiles(dir) {
+  try {
+    const out = execSync(
+      `find ${dir} -mindepth 1 -maxdepth 6 -type f 2>/dev/null | wc -l`,
+      { encoding: "utf8", timeout: 10000 }
+    );
+    return parseInt(out.trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function backupLooksSane() {
+  if (!fs.existsSync(BACKUP_DIR)) return false;
+  const files = countFiles(BACKUP_DIR);
+  // A real HA /config has dozens of files at minimum (configuration.yaml,
+  // automations.yaml, plus integrations). Refuse to "restore" from
+  // anything that looks suspiciously empty.
+  if (files < 5) {
+    console.error(
+      `[guardian] Backup at ${BACKUP_DIR} only has ${files} files — refusing to use it.`
+    );
+    return false;
+  }
+  // Also require at least one of the canonical HA entrypoints.
+  const sentinels = ["configuration.yaml", "configuration.yml", ".HA_VERSION"];
+  const hasSentinel = sentinels.some((s) =>
+    fs.existsSync(path.join(BACKUP_DIR, s))
+  );
+  if (!hasSentinel) {
+    console.error(
+      `[guardian] Backup at ${BACKUP_DIR} has no HA sentinel file — refusing to use it.`
+    );
+    return false;
+  }
+  return true;
+}
+
 function createBackup() {
   try {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    // Copy /config -> backup. `--delete` here only affects /data, not
+    // /config, so it is safe.
     execSync(
       `rsync -a --delete ${RSYNC_EXCLUDES} ${CONFIG_DIR}/ ${BACKUP_DIR}/`,
-      { timeout: 60000 }
+      { timeout: 120000 }
     );
-    console.log("[guardian] Backup created at", BACKUP_DIR);
+    console.log(
+      "[guardian] Backup created at",
+      BACKUP_DIR,
+      `(${countFiles(BACKUP_DIR)} files)`
+    );
   } catch (e) {
     console.error("[guardian] Backup failed:", e.message);
   }
 }
 
 function restoreBackup() {
-  try {
-    if (!fs.existsSync(BACKUP_DIR)) {
-      console.error("[guardian] No backup found, cannot restore");
-      return false;
-    }
-    execSync(
-      `rsync -a --delete ${RSYNC_EXCLUDES} ${BACKUP_DIR}/ ${CONFIG_DIR}/`,
-      { timeout: 60000 }
+  if (!backupLooksSane()) {
+    console.error(
+      "[guardian] Aborting restore: backup is missing, empty, or doesn't look like a real HA config."
     );
-    console.log("[guardian] Config restored from backup");
+    return false;
+  }
+  try {
+    // No `--delete`. We only copy files BACK from the backup. If
+    // OpenCode created new files we didn't snapshot, they remain on
+    // disk for the user to review or remove themselves — much safer
+    // than nuking /config to a possibly-stale baseline.
+    execSync(
+      `rsync -a ${RSYNC_EXCLUDES} ${BACKUP_DIR}/ ${CONFIG_DIR}/`,
+      { timeout: 120000 }
+    );
+    console.log("[guardian] Config files restored from backup (non-destructive)");
     return true;
   } catch (e) {
     console.error("[guardian] Restore failed:", e.message);
@@ -314,24 +370,27 @@ let opencodeProcess = null;
 let opencodeReady = false;
 
 function startOpenCode() {
-  console.log("[guardian] Starting OpenCode web UI for %s on 127.0.0.1:%d ...", CONFIG_DIR, OPENCODE_PORT);
+  console.log(
+    "[guardian] Starting `opencode serve` for %s on 127.0.0.1:%d ...",
+    CONFIG_DIR,
+    OPENCODE_PORT
+  );
 
+  // `opencode serve` and `opencode web` ship the same SPA. We use
+  // `serve` because `web` additionally tries to launch a desktop
+  // browser via xdg-open, which is meaningless inside the add-on
+  // container and previously caused the UI to come up in an empty
+  // state. Persistence (auth, projects, sessions) lives under
+  // ~/.local/share/opencode + ~/.config/opencode, which run.sh has
+  // symlinked into /data/oc-v2 already, so there is nothing to set
+  // here beyond inheriting the shell environment.
   opencodeProcess = spawn(
     "opencode",
-    ["web", "--hostname", "127.0.0.1", "--port", String(OPENCODE_PORT)],
+    ["serve", "--hostname", "127.0.0.1", "--port", String(OPENCODE_PORT)],
     {
       cwd: CONFIG_DIR,
       stdio: "inherit",
-      env: {
-        ...process.env,
-        HOME: "/root",
-        XDG_CONFIG_HOME: "/root/.config",
-        XDG_DATA_HOME: "/root/.local/share",
-        XDG_STATE_HOME: "/root/.local/state",
-        XDG_CACHE_HOME: "/root/.cache",
-        BROWSER: "/bin/true",
-        OPENCODE_DISABLE_AUTOUPDATE: "true",
-      },
+      env: process.env,
     }
   );
 
