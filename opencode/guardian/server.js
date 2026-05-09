@@ -503,14 +503,20 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
 window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
 
 // Layout pre-seed: the SPA's stored default sets the file-tree panel to
-// closed and the "changes" tab. Since /config isn't a git repo, "changes"
-// is empty and the panel looks blank. Override once per browser so first
-// load shows the full file tree.
+// closed and the "changes" tab. The "changes" tab queries the git diff;
+// even when /config is git-tracked it's commonly empty on first load,
+// so the pane looks blank. Override once per browser so first load shows
+// the full file tree on the "all" tab.
+//
+// The SPA stores layout under namespaced key "opencode.global.dat:layout"
+// (see SDK: rn.global("layout") -> {storage:"opencode.global.dat", key:"layout"}).
+// v1 of this seed wrote to the un-namespaced "layout" and was a silent no-op.
 (function () {
   try {
-    if (localStorage.getItem("__guardian_seeded_v1")) return;
+    if (localStorage.getItem("__guardian_seeded_v2")) return;
+    var KEY = "opencode.global.dat:layout";
     var current = null;
-    try { current = JSON.parse(localStorage.getItem("layout") || "null"); } catch (e) {}
+    try { current = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) {}
     var needsFix =
       !current ||
       !current.fileTree ||
@@ -523,9 +529,9 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
         tab: "all",
       });
       if (!merged.sidebar) merged.sidebar = { opened: true };
-      localStorage.setItem("layout", JSON.stringify(merged));
+      localStorage.setItem(KEY, JSON.stringify(merged));
     }
-    localStorage.setItem("__guardian_seeded_v1", "1");
+    localStorage.setItem("__guardian_seeded_v2", "1");
   } catch (e) {}
 })();
 
