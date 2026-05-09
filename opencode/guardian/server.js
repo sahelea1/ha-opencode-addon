@@ -1,48 +1,66 @@
 /**
- * ha-opencode-addon — Guardian Server
+ * ha-opencode-addon — Guardian Server (v1.15, workspace mode)
  *
- * Boots OpenCode (`opencode serve`) on a private port, proxies the
- * web UI through HA's ingress on 8099, and watches /config for
- * unconfirmed edits with a 10-minute auto-revert safety net.
+ * OpenCode now edits a sandboxed copy at /data/workspace, not /config
+ * directly. This solves two real problems:
  *
- * Flow:
- *   1. On startup: rsync /config -> /data/last-known-good (baseline).
- *   2. Poll /config every 5s, hash the relevant files.
- *   3. When the hash changes: open a 10-min confirm window.
- *   4. If the user clicks "Confirm": baseline = current state.
- *   5. If the timer expires (or the container crash-recovers in
- *      pending state): rsync the baseline BACK into /config,
- *      then ask HA Supervisor to reload.
+ *   1. OpenCode's project detection requires a `.git` directory. The
+ *      HA-managed /config typically has none, so opencode fell back
+ *      to a "global pseudo-project" and the SPA came up blank.
+ *      /data/workspace is git-init'd at boot, so opencode treats it
+ *      as a real project and the file tree / VCS panels populate.
+ *   2. Edits never touch /config silently. The user must click
+ *      `Apply`, which is the moment guardian's existing safety net
+ *      (backup + timed auto-revert + HA reload) kicks in.
  *
- * The restore step deliberately runs WITHOUT --delete and with a
- * sane-backup precondition, because v1.7's restore wiped /config
- * when the backup was empty/partial. Files added after the baseline
- * are left for the user to review, never silently deleted.
+ * Two-stage flow:
+ *
+ *   workspace clean ──(user edits)──> workspace dirty
+ *      │                                  │
+ *      │                                  ▼
+ *      │                           [Apply] [Discard]
+ *      │                                  │
+ *      │             ┌────────────────────┘
+ *      ▼             ▼
+ *   /config clean   /config pending  ──[timeout]──>  auto-revert
+ *      ▲             │
+ *      │             ▼
+ *      └──────────[Confirm]
+ *
+ * Endpoints (all under /__guardian__/api/):
+ *   GET  /status        — full state JSON
+ *   POST /apply         — workspace -> /config (enters pending)
+ *   POST /discard       — /config -> workspace (drop opencode edits)
+ *   POST /pull          — /config -> workspace (refresh from HA-side edits)
+ *   POST /confirm       — /config (pending) -> baseline
+ *   POST /revert        — baseline -> /config (and -> workspace)
  */
 
 const http = require("http");
 const httpProxy = require("http-proxy");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 const { spawn, execSync } = require("child_process");
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const OPENCODE_PORT = 8100; // OpenCode binds here on 127.0.0.1
-const GUARDIAN_PORT = 8099; // HA ingress hits this
-const CONFIG_DIR = "/config";
-const DATA_DIR = "/data";
-const BACKUP_DIR = path.join(DATA_DIR, "last-known-good");
-const STATE_FILE = path.join(DATA_DIR, "guardian-state.json");
+const OPENCODE_PORT = 8100;
+const GUARDIAN_PORT = 8099;
+const CONFIG_DIR    = process.env.HA_CONFIG_DIR  || "/config";
+const WORKSPACE_DIR = process.env.WORKSPACE_DIR  || "/data/workspace";
+const DATA_DIR      = "/data";
+const BACKUP_DIR    = path.join(DATA_DIR, "last-known-good");
+const STATE_FILE    = path.join(DATA_DIR, "guardian-state.json");
 const POLL_INTERVAL_MS = 5000;
 
 const TIMEOUT_MS =
   (parseInt(process.env.GUARDIAN_TIMEOUT_MIN, 10) || 10) * 60 * 1000;
 
-// HA-managed paths we never back up or hash. Most are dynamic state
-// (DB, secrets, .storage); .HA_VERSION changes on every HA upgrade.
+// HA-managed paths we never sync, hash, or back up. Most are dynamic
+// state (DB, secrets, .storage); .HA_VERSION changes on every HA upgrade.
+// .git is excluded so the workspace's local commit history doesn't
+// leak into /config and vice versa.
 const EXCLUDES = [
   "home-assistant_v2.db",
   "home-assistant_v2.db-shm",
@@ -53,6 +71,7 @@ const EXCLUDES = [
   "__pycache__",
   "tts",
   ".HA_VERSION",
+  ".git",
 ];
 const RSYNC_EXCLUDES = EXCLUDES.map((e) => `--exclude=${e}`).join(" ");
 
@@ -64,11 +83,18 @@ const CLIENT_SCRIPT = fs.readFileSync(
 // ---------------------------------------------------------------------------
 // State (persisted to disk so we survive container restarts)
 // ---------------------------------------------------------------------------
+const MAX_CHANGED_FILES_SHOWN = 200;
+
 let state = {
-  status: "idle", // "idle" | "pending"
+  status: "idle",          // "idle" | "pending" — refers to /config vs baseline
   deadline: null,
-  changedFiles: [],
-  lastHash: null,
+};
+
+let liveStats = {
+  workspaceDirty: false,
+  workspaceChangedFiles: [],
+  configDirtyVsBackup: false,
+  configChangedFiles: [],
 };
 
 function loadState() {
@@ -91,25 +117,30 @@ function saveState() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Change detection — md5 over the YAML/JSON/PY/CONF/JS files in /config.
-// We don't hash the whole tree because the HA DB constantly changes.
-// ---------------------------------------------------------------------------
-function getConfigHash() {
+function resetStateToIdle() {
+  state.status = "idle";
+  state.deadline = null;
+  saveState();
+}
+
+function diffDirs(src, dst) {
   try {
-    const excludeArgs = EXCLUDES.map(
-      (e) => `-not -path '*/${e}' -not -path '*/${e}/*'`
-    ).join(" ");
-    const cmd = `find ${CONFIG_DIR} -maxdepth 4 \\( -name '*.yaml' -o -name '*.json' -o -name '*.py' -o -name '*.conf' -o -name '*.js' \\) ${excludeArgs} -type f -exec md5sum {} + 2>/dev/null | sort`;
-    const output = execSync(cmd, { encoding: "utf8", timeout: 15000 });
-    return crypto.createHash("md5").update(output).digest("hex");
-  } catch (e) {
-    return null;
+    const out = execSync(
+      `rsync -n -a --delete ${RSYNC_EXCLUDES} --out-format='%n' ${src}/ ${dst}/ 2>/dev/null || true`,
+      { encoding: "utf8", timeout: 15000 }
+    );
+    return out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.endsWith("/"))
+      .slice(0, MAX_CHANGED_FILES_SHOWN);
+  } catch {
+    return [];
   }
 }
 
 // ---------------------------------------------------------------------------
-// Backup + restore
+// Sync primitives
 // ---------------------------------------------------------------------------
 function countFiles(dir) {
   try {
@@ -125,63 +156,73 @@ function countFiles(dir) {
   }
 }
 
-// Sanity check: never restore from an empty / non-HA-looking dir.
-// Without this, a partial first-boot snapshot + --delete combo
-// would wipe the user's real /config.
-function backupLooksSane() {
-  if (!fs.existsSync(BACKUP_DIR)) return false;
-  if (countFiles(BACKUP_DIR) < 5) {
-    console.error(
-      `[guardian] Backup at ${BACKUP_DIR} has fewer than 5 files — refusing to restore.`
-    );
+// Refuse to sync FROM a source that obviously isn't a real HA
+// config tree. Without this, an empty / partially-mounted source
+// + --delete would wipe the destination.
+function sourceLooksSane(src) {
+  if (countFiles(src) < 3) {
+    console.error(`[guardian] Refusing sync from ${src}: < 3 files`);
     return false;
   }
   const hasSentinel = ["configuration.yaml", "configuration.yml"].some((s) =>
-    fs.existsSync(path.join(BACKUP_DIR, s))
+    fs.existsSync(path.join(src, s))
   );
   if (!hasSentinel) {
-    console.error(
-      `[guardian] Backup at ${BACKUP_DIR} has no configuration.yaml — refusing to restore.`
-    );
+    console.error(`[guardian] Refusing sync from ${src}: no configuration.yaml`);
     return false;
   }
   return true;
 }
 
-function createBackup() {
+function syncDirs(src, dst, withDelete) {
+  fs.mkdirSync(dst, { recursive: true });
+  const flags = withDelete ? "-a --delete" : "-a";
+  execSync(`rsync ${flags} ${RSYNC_EXCLUDES} ${src}/ ${dst}/`, {
+    timeout: 180000,
+  });
+}
+
+function gitCommitWorkspace(message) {
   try {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    // --delete here is safe because it operates on /data/last-known-good,
-    // never on /config.
     execSync(
-      `rsync -a --delete ${RSYNC_EXCLUDES} ${CONFIG_DIR}/ ${BACKUP_DIR}/`,
-      { timeout: 120000 }
+      `git -C ${WORKSPACE_DIR} add -A && git -C ${WORKSPACE_DIR} -c commit.gpgsign=false commit -q --allow-empty -m ${JSON.stringify(message)}`,
+      { timeout: 30000 }
     );
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Backup + restore (the /config <-> /data/last-known-good safety net)
+// ---------------------------------------------------------------------------
+function createBackup() {
+  if (!sourceLooksSane(CONFIG_DIR)) {
+    console.error("[guardian] Skipping backup: /config doesn't look sane.");
+    return false;
+  }
+  try {
+    syncDirs(CONFIG_DIR, BACKUP_DIR, /*withDelete=*/ true);
     console.log(
       `[guardian] Backup created at ${BACKUP_DIR} (${countFiles(BACKUP_DIR)} files)`
     );
+    return true;
   } catch (e) {
     console.error("[guardian] Backup failed:", e.message);
+    return false;
   }
 }
 
 function restoreBackup() {
-  if (!backupLooksSane()) {
+  if (!sourceLooksSane(BACKUP_DIR)) {
     console.error(
-      "[guardian] Aborting restore: backup is missing/empty/doesn't look like an HA config."
+      "[guardian] Aborting restore: backup is missing/empty/not HA-shaped."
     );
     return false;
   }
   try {
-    // No --delete: copy baseline files BACK into /config. Modified
-    // files revert, deleted files come back. Files OpenCode created
-    // that weren't in the baseline stay on disk for the user to
-    // review or remove themselves — much safer than nuking /config.
-    execSync(
-      `rsync -a ${RSYNC_EXCLUDES} ${BACKUP_DIR}/ ${CONFIG_DIR}/`,
-      { timeout: 120000 }
-    );
-    console.log("[guardian] Config files restored from backup (non-destructive)");
+    // No --delete: files OpenCode created stay on disk so the user
+    // can review them. Modified files revert; deleted files come back.
+    syncDirs(BACKUP_DIR, CONFIG_DIR, /*withDelete=*/ false);
+    console.log("[guardian] /config restored from backup (non-destructive)");
     return true;
   } catch (e) {
     console.error("[guardian] Restore failed:", e.message);
@@ -189,21 +230,55 @@ function restoreBackup() {
   }
 }
 
-function getChangedFiles() {
+// ---------------------------------------------------------------------------
+// Workspace operations (the new /data/workspace <-> /config layer)
+// ---------------------------------------------------------------------------
+function applyWorkspaceToConfig() {
+  if (!sourceLooksSane(WORKSPACE_DIR)) {
+    return { ok: false, message: "Workspace is empty or invalid." };
+  }
   try {
-    if (!fs.existsSync(BACKUP_DIR)) return [];
-    const output = execSync(
-      `rsync -n -a --delete ${RSYNC_EXCLUDES} --out-format='%n' ${CONFIG_DIR}/ ${BACKUP_DIR}/ 2>/dev/null | head -30 || true`,
-      { encoding: "utf8", timeout: 10000 }
-    );
-    return output
-      .split("\n")
-      .filter((l) => l.trim() && !l.endsWith("/"))
-      .map((f) => f.trim());
-  } catch {
-    return [];
+    // Snapshot pre-apply /config so Revert restores HA's known-good
+    // state, not the just-applied broken one.
+    if (!createBackup()) {
+      return { ok: false, message: "Failed to create pre-apply backup." };
+    }
+    syncDirs(WORKSPACE_DIR, CONFIG_DIR, /*withDelete=*/ true);
+
+    state.status = "pending";
+    state.deadline = Date.now() + TIMEOUT_MS;
+    saveState();
+
+    // If reload fails the timer still protects the user.
+    reloadHA();
+    console.log("[guardian] Applied workspace -> /config; reload requested");
+    return { ok: true, message: "Applied. Confirm or revert before timeout." };
+  } catch (e) {
+    console.error("[guardian] Apply failed:", e.message);
+    return { ok: false, message: "Apply failed: " + e.message };
   }
 }
+
+function syncConfigToWorkspace(verb) {
+  if (!sourceLooksSane(CONFIG_DIR)) {
+    return { ok: false, message: "/config doesn't look sane." };
+  }
+  try {
+    syncDirs(CONFIG_DIR, WORKSPACE_DIR, /*withDelete=*/ true);
+    // Commit so the SPA's diff view shows a clean state.
+    gitCommitWorkspace(`${verb} from /config`);
+    console.log(`[guardian] ${verb}: /config -> workspace`);
+    return { ok: true, message: `Workspace ${verb.toLowerCase()}ed from /config.` };
+  } catch (e) {
+    console.error(`[guardian] ${verb} failed:`, e.message);
+    return { ok: false, message: `${verb} failed: ` + e.message };
+  }
+}
+
+// Discard and Pull are the same operation with different intent:
+// discard = "throw away my edits"; pull = "fetch HA-side updates".
+const pullConfigToWorkspace = () => syncConfigToWorkspace("Pull");
+const discardWorkspace      = () => syncConfigToWorkspace("Discard");
 
 // ---------------------------------------------------------------------------
 // HA Supervisor API
@@ -263,27 +338,28 @@ function reloadHA() {
 }
 
 // ---------------------------------------------------------------------------
-// Confirm / revert
+// Confirm / revert (the /config-vs-baseline safety net)
 // ---------------------------------------------------------------------------
 function confirmChanges() {
   console.log("[guardian] User confirmed changes");
-  createBackup(); // new baseline
-  state.status = "idle";
-  state.deadline = null;
-  state.changedFiles = [];
-  state.lastHash = getConfigHash();
-  saveState();
+  createBackup();
+  resetStateToIdle();
   return { ok: true, message: "Changes confirmed. New baseline saved." };
 }
 
 function revertChanges() {
   console.log("[guardian] Reverting changes...");
   const restored = restoreBackup();
-  state.status = "idle";
-  state.deadline = null;
-  state.changedFiles = [];
-  state.lastHash = getConfigHash();
-  saveState();
+  if (restored) {
+    // Sync workspace back to baseline so the SPA's view doesn't
+    // diverge from /config after revert.
+    try {
+      syncDirs(BACKUP_DIR, WORKSPACE_DIR, /*withDelete=*/ true);
+    } catch (e) {
+      console.error("[guardian] Workspace re-sync after revert failed:", e.message);
+    }
+  }
+  resetStateToIdle();
   if (restored) {
     reloadHA();
     return { ok: true, message: "Changes reverted. HA reload triggered." };
@@ -300,47 +376,29 @@ function crashRecovery() {
     console.log("======================================================");
     console.log("  CRASH RECOVERY: pending changes found — reverting!");
     console.log("======================================================");
-    if (fs.existsSync(BACKUP_DIR)) {
-      restoreBackup();
-      setTimeout(() => reloadHA(), 5000);
-    }
-    state.status = "idle";
-    state.deadline = null;
-    state.changedFiles = [];
-    saveState();
+    if (restoreBackup()) reloadHA();
+    resetStateToIdle();
   }
 }
 
 // ---------------------------------------------------------------------------
-// File watcher
+// Watcher — refresh dirty-state stats and enforce the pending timeout.
 // ---------------------------------------------------------------------------
 function startWatcher() {
-  state.lastHash = getConfigHash();
   console.log(
     `[guardian] Watcher started (polling every ${POLL_INTERVAL_MS / 1000}s)`
   );
 
   setInterval(() => {
     try {
-      const currentHash = getConfigHash();
-      if (!currentHash) return;
+      liveStats.workspaceChangedFiles = diffDirs(WORKSPACE_DIR, CONFIG_DIR);
+      liveStats.workspaceDirty = liveStats.workspaceChangedFiles.length > 0;
+      liveStats.configChangedFiles = diffDirs(CONFIG_DIR, BACKUP_DIR);
+      liveStats.configDirtyVsBackup = liveStats.configChangedFiles.length > 0;
 
-      if (state.status === "idle") {
-        if (currentHash !== state.lastHash) {
-          console.log("[guardian] Config changes detected — opening confirm window");
-          state.status = "pending";
-          state.deadline = Date.now() + TIMEOUT_MS;
-          state.changedFiles = getChangedFiles();
-          saveState();
-        }
-      } else if (state.status === "pending") {
-        state.changedFiles = getChangedFiles();
-        if (Date.now() > state.deadline) {
-          console.log("[guardian] TIMEOUT — auto-reverting");
-          revertChanges();
-          return;
-        }
-        saveState();
+      if (state.status === "pending" && Date.now() > state.deadline) {
+        console.log("[guardian] TIMEOUT — auto-reverting");
+        revertChanges();
       }
     } catch (e) {
       console.error("[guardian] Watcher error:", e.message);
@@ -356,7 +414,7 @@ let opencodeReady = false;
 
 function startOpenCode() {
   console.log(
-    `[guardian] Starting \`opencode serve\` for ${CONFIG_DIR} on 127.0.0.1:${OPENCODE_PORT}`
+    `[guardian] Starting \`opencode serve\` cwd=${WORKSPACE_DIR} on 127.0.0.1:${OPENCODE_PORT}`
   );
 
   // `serve` (not `web`) — `web` tries to launch a desktop browser
@@ -366,7 +424,7 @@ function startOpenCode() {
     "opencode",
     ["serve", "--hostname", "127.0.0.1", "--port", String(OPENCODE_PORT)],
     {
-      cwd: CONFIG_DIR, // project root = HA /config
+      cwd: WORKSPACE_DIR,
       stdio: "inherit",
       env: process.env,
     }
@@ -384,13 +442,14 @@ function startOpenCode() {
     setTimeout(startOpenCode, 5000);
   });
 
-  const readyCheck = startReadyCheck();
+  startReadyCheck();
 }
 
 function ensureStarterSession() {
-  // On a fresh install the SPA's session list is empty and the user lands on
-  // a blank screen. Pre-create a session so they can start chatting in /config
-  // immediately. Idempotent: only fires when GET /session returns [].
+  // On a fresh install the SPA's session list is empty and the user
+  // lands on a blank screen. Pre-create a session so they can start
+  // chatting immediately. Idempotent: only fires when GET /session
+  // returns [].
   const get = http.get(
     `http://127.0.0.1:${OPENCODE_PORT}/session`,
     { timeout: 3000 },
@@ -413,9 +472,9 @@ function ensureStarterSession() {
           (r) => {
             r.resume();
             if (r.statusCode >= 200 && r.statusCode < 300) {
-              console.log("[guardian] Created starter session for /config");
+              console.log("[guardian] Created starter session");
             } else {
-              console.log("[guardian] Starter session POST returned status " + r.statusCode);
+              console.log("[guardian] Starter session POST returned " + r.statusCode);
             }
           }
         );
@@ -453,6 +512,38 @@ function startReadyCheck() {
 }
 
 // ---------------------------------------------------------------------------
+// Loading page — shown to clients while opencode is still booting and
+// returned from the proxy error handler too, so it must be defined
+// before the proxy handlers reference it.
+// ---------------------------------------------------------------------------
+const LOADING_PAGE = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>ha-opencode-addon — Starting</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="3">
+  <style>
+    body { background:#0d1117; color:#c9d1d9; font-family:system-ui,sans-serif;
+      margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; }
+    .card { text-align:center; }
+    .spinner { width:40px; height:40px; margin:0 auto 18px; border-radius:50%;
+      border:3px solid #21262d; border-top-color:#58a6ff; animation:spin 0.8s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    h1 { font-size:18px; font-weight:500; margin:0 0 6px; }
+    p  { font-size:13px; color:#8b949e; margin:0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h1>ha-opencode-addon is starting…</h1>
+    <p>This page refreshes automatically.</p>
+  </div>
+</body>
+</html>`;
+
+// ---------------------------------------------------------------------------
 // HTTP proxy — forwards to OpenCode, injects guardian banner into HTML,
 // and rewrites paths so the SPA loads correctly behind HA ingress.
 //
@@ -488,7 +579,6 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
       let body = Buffer.concat(chunks).toString("utf8");
       const ingressPath = (req.headers["x-ingress-path"] || "").replace(/\/$/, "");
 
-      // Layer 2: rewrite absolute attribute paths in the HTML.
       if (ingressPath) {
         body = body.replace(
           /((?:src|href|action|data-src)=["'])(\/(?!\/))/g,
@@ -496,21 +586,14 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
         );
       }
 
-      // Layer 1 + 3: <base> + runtime patcher + guardian banner.
       const baseHref = ingressPath ? `${ingressPath}/` : "/";
       const injection = `<base href="${baseHref}">
 <script>
 window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
 
 // Layout pre-seed: the SPA's stored default sets the file-tree panel to
-// closed and the "changes" tab. The "changes" tab queries the git diff;
-// even when /config is git-tracked it's commonly empty on first load,
-// so the pane looks blank. Override once per browser so first load shows
-// the full file tree on the "all" tab.
-//
-// The SPA stores layout under namespaced key "opencode.global.dat:layout"
-// (see SDK: rn.global("layout") -> {storage:"opencode.global.dat", key:"layout"}).
-// v1 of this seed wrote to the un-namespaced "layout" and was a silent no-op.
+// closed and the "changes" tab. Override once per browser so first load
+// shows the full file tree on the "all" tab.
 (function () {
   try {
     if (localStorage.getItem("__guardian_seeded_v2")) return;
@@ -541,17 +624,13 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
   var _origin = window.location.origin;
   var _wsHost = window.location.host;
 
-  // Returns the rewritten URL string if rewriting is needed, else null.
-  // Handles: relative paths, root-absolute paths, and same-origin absolute URLs.
   function rewriteHttpUrl(input) {
     if (typeof input !== "string") return null;
     try {
-      // Fast path: root-absolute path that doesn't already have the prefix.
       if (input.charAt(0) === "/" && input.charAt(1) !== "/") {
         if (input.slice(0, _ip.length) !== _ip) return _ip + input;
         return null;
       }
-      // Otherwise: try to parse as URL (relative or absolute).
       var u = new URL(input, _origin);
       if (u.origin === _origin && u.pathname.slice(0, _ip.length) !== _ip) {
         u.pathname = _ip + u.pathname;
@@ -573,11 +652,9 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
     return null;
   }
 
-  // ---- fetch ---------------------------------------------------------------
   var _fetch = window.fetch;
   window.fetch = function (resource, init) {
     try {
-      // Request object: rebuild with rewritten URL.
       if (typeof Request !== "undefined" && resource instanceof Request) {
         var newUrl = rewriteHttpUrl(resource.url);
         if (newUrl) {
@@ -595,7 +672,6 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
             signal: resource.signal,
           };
           if (hasBody) {
-            // Materialize body to ArrayBuffer to avoid streaming-body pitfalls.
             return resource.clone().arrayBuffer().then(function (buf) {
               if (buf && buf.byteLength > 0) initFromReq.body = buf;
               if (init) Object.assign(initFromReq, init);
@@ -608,14 +684,12 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
         return _fetch.call(this, resource, init);
       }
 
-      // String URL.
       if (typeof resource === "string") {
         var s = rewriteHttpUrl(resource);
         if (s !== null) resource = s;
         return _fetch.call(this, resource, init);
       }
 
-      // URL object.
       if (resource && typeof resource.href === "string") {
         var s2 = rewriteHttpUrl(resource.href);
         if (s2 !== null) return _fetch.call(this, s2, init);
@@ -624,7 +698,6 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
     return _fetch.call(this, resource, init);
   };
 
-  // ---- XMLHttpRequest ------------------------------------------------------
   var _open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
     if (typeof url === "string") {
@@ -637,7 +710,6 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
     return _open.apply(this, arguments);
   };
 
-  // ---- WebSocket -----------------------------------------------------------
   var _WS = window.WebSocket;
   function PatchedWS(url, protocols) {
     if (typeof url === "string") {
@@ -656,7 +728,6 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
   PatchedWS.CLOSED     = _WS.CLOSED;
   window.WebSocket = PatchedWS;
 
-  // ---- EventSource (defensive) --------------------------------------------
   if (typeof window.EventSource === "function") {
     var _ES = window.EventSource;
     function PatchedES(url, init) {
@@ -676,7 +747,6 @@ window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
     window.EventSource = PatchedES;
   }
 
-  // ---- navigator.sendBeacon (defensive) -----------------------------------
   if (navigator && typeof navigator.sendBeacon === "function") {
     var _sb = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (url, data) {
@@ -707,13 +777,12 @@ ${CLIENT_SCRIPT}
       delete headers["content-encoding"];
       delete headers["content-security-policy"];
       delete headers["content-security-policy-report-only"];
-      delete headers["x-frame-options"]; // allow embedding in HA iframe
+      delete headers["x-frame-options"];
 
       res.writeHead(proxyRes.statusCode, headers);
       res.end(body);
     });
   } else {
-    // Non-HTML: stream straight through (preserves SSE / chunked).
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   }
@@ -728,35 +797,8 @@ proxy.on("error", (err, req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Loading + status pages
+// Status page (server-rendered fallback for the floating banner)
 // ---------------------------------------------------------------------------
-const LOADING_PAGE = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>ha-opencode-addon — Starting</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="3">
-  <style>
-    body { background:#0d1117; color:#c9d1d9; font-family:system-ui,sans-serif;
-      margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; }
-    .card { text-align:center; }
-    .spinner { width:40px; height:40px; margin:0 auto 18px; border-radius:50%;
-      border:3px solid #21262d; border-top-color:#58a6ff; animation:spin 0.8s linear infinite; }
-    @keyframes spin { to { transform:rotate(360deg); } }
-    h1 { font-size:18px; font-weight:500; margin:0 0 6px; }
-    p  { font-size:13px; color:#8b949e; margin:0; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="spinner"></div>
-    <h1>ha-opencode-addon is starting…</h1>
-    <p>This page refreshes automatically.</p>
-  </div>
-</body>
-</html>`;
-
 function getStatusPage(req) {
   const remaining = state.deadline ? Math.max(0, state.deadline - Date.now()) : null;
   const min = remaining ? Math.floor(remaining / 60000) : 0;
@@ -765,9 +807,46 @@ function getStatusPage(req) {
     ? req.headers["x-ingress-path"].replace(/\/$/, "")
     : "";
   const isPending = state.status === "pending";
-  const filesList = (state.changedFiles || [])
-    .map((f) => `<li><code>${f.replace(/[<>&]/g, "")}</code></li>`)
-    .join("");
+  const isWorkspaceDirty = liveStats.workspaceDirty && !isPending;
+
+  const fileLi = (files) =>
+    (files || []).map((f) => `<li><code>${f.replace(/[<>&]/g, "")}</code></li>`).join("");
+
+  let cardClass = "idle";
+  let title = "All clear";
+  let body = "";
+  if (isPending) {
+    cardClass = "pending";
+    title = "Changes applied — pending HA validation";
+    body = `<div class="timer">${min}:${String(sec).padStart(2, "0")}</div>
+      ${liveStats.configChangedFiles.length ? `<ul>${fileLi(liveStats.configChangedFiles)}</ul>` : ""}
+      <div class="actions">
+        <form method="POST" action="${ingressPath}/__guardian__/api/confirm">
+          <button class="confirm">Confirm</button>
+        </form>
+        <form method="POST" action="${ingressPath}/__guardian__/api/revert">
+          <button class="revert">Revert</button>
+        </form>
+      </div>`;
+  } else if (isWorkspaceDirty) {
+    cardClass = "workspace";
+    title = "Workspace changes ready to apply";
+    body = `${liveStats.workspaceChangedFiles.length ? `<ul>${fileLi(liveStats.workspaceChangedFiles)}</ul>` : ""}
+      <div class="actions">
+        <form method="POST" action="${ingressPath}/__guardian__/api/apply">
+          <button class="confirm">Apply to /config</button>
+        </form>
+        <form method="POST" action="${ingressPath}/__guardian__/api/discard">
+          <button class="revert">Discard</button>
+        </form>
+      </div>`;
+  } else {
+    body = `<div class="actions">
+        <form method="POST" action="${ingressPath}/__guardian__/api/pull">
+          <button class="confirm">Pull from /config</button>
+        </form>
+      </div>`;
+  }
 
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -778,11 +857,12 @@ function getStatusPage(req) {
   h1 { color:#58a6ff; font-size:20px; margin:0 0 16px; }
   .card { background:#161b22; border:1px solid #30363d; border-left-width:4px;
     border-radius:8px; padding:18px; margin-bottom:14px; }
-  .idle    { border-left-color:#3fb950; }
-  .pending { border-left-color:#d29922; }
+  .idle      { border-left-color:#3fb950; }
+  .workspace { border-left-color:#58a6ff; }
+  .pending   { border-left-color:#d29922; }
   .timer   { font-size:32px; font-weight:700; color:#d29922; margin:8px 0; }
   ul { list-style:none; padding:0; margin:8px 0 0; font-size:12px; color:#8b949e; }
-  .actions { display:flex; gap:10px; }
+  .actions { display:flex; gap:10px; margin-top:12px; }
   button { padding:8px 18px; border:0; border-radius:6px; font-weight:600;
     cursor:pointer; font-family:inherit; }
   .confirm { background:#238636; color:#fff; }
@@ -790,18 +870,9 @@ function getStatusPage(req) {
 </style></head>
 <body>
   <h1>Config Guardian</h1>
-  <div class="card ${isPending ? "pending" : "idle"}">
-    <strong>${isPending ? "Changes pending" : "All clear"}</strong>
-    ${isPending ? `<div class="timer">${min}:${String(sec).padStart(2, "0")}</div>
-      ${filesList ? `<ul>${filesList}</ul>` : ""}
-      <div class="actions">
-        <form method="POST" action="${ingressPath}/__guardian__/api/confirm">
-          <button class="confirm">Confirm changes</button>
-        </form>
-        <form method="POST" action="${ingressPath}/__guardian__/api/revert">
-          <button class="revert">Revert</button>
-        </form>
-      </div>` : ""}
+  <div class="card ${cardClass}">
+    <strong>${title}</strong>
+    ${body}
   </div>
 </body></html>`;
 }
@@ -809,50 +880,63 @@ function getStatusPage(req) {
 // ---------------------------------------------------------------------------
 // Main HTTP server
 // ---------------------------------------------------------------------------
+function jsonResponse(res, code, obj) {
+  res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(obj));
+}
+
+function actionResponse(req, res, result) {
+  if ((req.headers.accept || "").includes("text/html")) {
+    res.writeHead(303, { Location: "/__guardian__/" });
+    res.end();
+  } else {
+    jsonResponse(res, result.ok ? 200 : 400, result);
+  }
+}
+
 const server = http.createServer((req, res) => {
   const pathname = new URL(req.url, `http://${req.headers.host || "localhost"}`).pathname;
 
   if (pathname === "/__guardian__/api/status") {
     const remaining = state.deadline ? Math.max(0, state.deadline - Date.now()) : null;
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store",
-    });
-    res.end(JSON.stringify({
+    return jsonResponse(res, 200, {
       status: state.status,
       remainingMs: remaining,
-      changedFiles: state.changedFiles,
       timeoutMinutes: TIMEOUT_MS / 60000,
-    }));
-    return;
+      changedFiles: liveStats.configChangedFiles,
+      workspace: {
+        dirty: liveStats.workspaceDirty,
+        changedFiles: liveStats.workspaceChangedFiles,
+      },
+      config: {
+        dirtyVsBackup: liveStats.configDirtyVsBackup,
+        changedFiles: liveStats.configChangedFiles,
+      },
+    });
   }
 
-  if (pathname === "/__guardian__/api/confirm" && req.method === "POST") {
-    const result = state.status === "pending"
-      ? confirmChanges()
-      : { ok: false, message: "No pending changes to confirm." };
-    if ((req.headers.accept || "").includes("text/html")) {
-      res.writeHead(303, { Location: "/__guardian__/" });
-      res.end();
-    } else {
-      res.writeHead(result.ok ? 200 : 400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result));
+  if (req.method === "POST") {
+    if (pathname === "/__guardian__/api/apply") {
+      return actionResponse(req, res, applyWorkspaceToConfig());
     }
-    return;
-  }
-
-  if (pathname === "/__guardian__/api/revert" && req.method === "POST") {
-    const result = state.status === "pending"
-      ? revertChanges()
-      : { ok: false, message: "No pending changes to revert." };
-    if ((req.headers.accept || "").includes("text/html")) {
-      res.writeHead(303, { Location: "/__guardian__/" });
-      res.end();
-    } else {
-      res.writeHead(result.ok ? 200 : 400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result));
+    if (pathname === "/__guardian__/api/discard") {
+      return actionResponse(req, res, discardWorkspace());
     }
-    return;
+    if (pathname === "/__guardian__/api/pull") {
+      return actionResponse(req, res, pullConfigToWorkspace());
+    }
+    if (pathname === "/__guardian__/api/confirm") {
+      const result = state.status === "pending"
+        ? confirmChanges()
+        : { ok: false, message: "No pending changes to confirm." };
+      return actionResponse(req, res, result);
+    }
+    if (pathname === "/__guardian__/api/revert") {
+      const result = state.status === "pending"
+        ? revertChanges()
+        : { ok: false, message: "No pending changes to revert." };
+      return actionResponse(req, res, result);
+    }
   }
 
   if (pathname === "/__guardian__/" || pathname === "/__guardian__") {
@@ -879,16 +963,22 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ---------------------------------------------------------------------------
-// Boot
+// Boot — launch opencode first so the user-visible loading page flips to
+// the SPA as soon as possible, then run the slower rsync/backup work in
+// the background. applyWorkspaceToConfig() always re-runs createBackup
+// before any /config write so safety isn't compromised by deferring it.
 // ---------------------------------------------------------------------------
+console.log(`[guardian] CONFIG_DIR=${CONFIG_DIR}  WORKSPACE_DIR=${WORKSPACE_DIR}`);
 console.log("[guardian] Running crash recovery check...");
 crashRecovery();
-console.log("[guardian] Creating initial backup...");
-createBackup();
-console.log("[guardian] Starting file watcher...");
-startWatcher();
 console.log("[guardian] Launching OpenCode...");
 startOpenCode();
+console.log("[guardian] Starting file watcher...");
+startWatcher();
+setImmediate(() => {
+  console.log("[guardian] Creating initial backup (async)...");
+  createBackup();
+});
 
 server.listen(GUARDIAN_PORT, "0.0.0.0", () => {
   console.log(`[guardian] Listening on 0.0.0.0:${GUARDIAN_PORT}`);
