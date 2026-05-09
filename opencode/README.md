@@ -116,11 +116,11 @@ Everything in `/config` **except**:
 
 | Data | Location | Survives restart? |
 |---|---|---|
-| OpenCode settings | `/data/opencode-config/` | ✅ |
-| OpenCode auth/sessions | `/data/opencode-share/` | ✅ |
+| OpenCode settings | `/data/oc-v3/config/` | ✅ |
+| OpenCode auth/sessions | `/data/oc-v3/share/` | ✅ |
 | Config backup (last known good) | `/data/last-known-good/` | ✅ |
 | Guardian state | `/data/guardian-state.json` | ✅ |
-| Your HA config files | `/config/` mapped, `/root/ha-config` symlink | ✅ |
+| Your HA config files | `/config/` mapped | ✅ |
 
 ## Updating OpenCode
 
