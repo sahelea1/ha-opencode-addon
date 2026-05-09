@@ -2,19 +2,20 @@
  * Config Guardian — Client Banner
  *
  * Injected into OpenCode's HTML by the proxy. Polls the guardian API and
- * shows a floating Material-3-style confirmation bar when config changes
- * are pending.
+ * shows a floating banner that handles two states:
+ *
+ *   - workspace dirty: opencode edited files; ask the user to Apply or Discard
+ *   - pending:         changes were Apply'd to /config; user must Confirm or
+ *                      Revert before the timer expires
  */
 (function () {
   "use strict";
 
-  // Resolve guardian API base URL from the ingress root, not the current SPA
-  // route, so the buttons keep working after navigation inside OpenCode.
   var ingressRoot = window.__GUARDIAN_BASE_PATH || "";
   var API_BASE = ingressRoot + "/__guardian__/api/";
   var POLL_MS = 3000;
 
-  // ── Inject styles (Material Design 3-ish) ───────────────────────────
+  // ── Inject styles ───────────────────────────────────────────────────
   var style = document.createElement("style");
   style.textContent = [
     "#gcfg-bar{",
@@ -51,12 +52,16 @@
     "  color:#fff;font:800 16px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;",
     "  letter-spacing:-1px;",
     "}",
+    "#gcfg-bar.workspace .gcfg-dot{",
+    "  background:linear-gradient(135deg,#0ea5e9 0%,#3b82f6 50%,#6366f1 100%);",
+    "}",
 
     "#gcfg-bar .gcfg-time{",
     "  flex-shrink:0;font:700 22px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;",
     "  color:#a78bfa;letter-spacing:.5px;font-variant-numeric:tabular-nums;",
     "  min-width:62px;text-align:center;",
     "}",
+    "#gcfg-bar.workspace .gcfg-time{display:none;}",
     "#gcfg-bar.urgent .gcfg-time{color:#fb7185;}",
 
     "#gcfg-bar .gcfg-text{flex:1;min-width:0;display:flex;flex-direction:column;}",
@@ -75,15 +80,16 @@
     "#gcfg-bar .gcfg-btn:hover{filter:brightness(1.1);transform:translateY(-1px);}",
     "#gcfg-bar .gcfg-btn:active{transform:translateY(0);filter:brightness(.95);}",
     "#gcfg-bar .gcfg-btn:focus-visible{outline:2px solid #a78bfa;outline-offset:2px;}",
-    "#gcfg-bar .gcfg-confirm{",
+    "#gcfg-bar .gcfg-btn[disabled]{opacity:.55;cursor:wait;filter:grayscale(.3);}",
+    "#gcfg-bar .gcfg-primary{",
     "  background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;",
     "  box-shadow:0 6px 16px rgba(34,197,94,.35);",
     "}",
-    "#gcfg-bar .gcfg-revert{",
+    "#gcfg-bar .gcfg-secondary{",
     "  background:rgba(244,63,94,.12);color:#fb7185;",
     "  border:1px solid rgba(244,63,94,.4);",
     "}",
-    "#gcfg-bar .gcfg-revert:hover{background:rgba(244,63,94,.22);}",
+    "#gcfg-bar .gcfg-secondary:hover{background:rgba(244,63,94,.22);}",
 
     "#gcfg-bar.urgent .gcfg-pill{",
     "  border-color:rgba(244,63,94,.55);",
@@ -104,9 +110,11 @@
     "  box-shadow:0 12px 32px rgba(0,0,0,.35);",
     "}",
     "#gcfg-toast.show{transform:translateX(-50%) translateY(0);opacity:1;}",
-    "#gcfg-toast.success{background:linear-gradient(135deg,#22c55e,#16a34a);}",
+    "#gcfg-toast.success {background:linear-gradient(135deg,#22c55e,#16a34a);}",
+    "#gcfg-toast.info    {background:linear-gradient(135deg,#3b82f6,#1d4ed8);}",
     "#gcfg-toast.reverted{background:linear-gradient(135deg,#f43f5e,#e11d48);}",
-    "",
+    "#gcfg-toast.error   {background:linear-gradient(135deg,#f59e0b,#d97706);}",
+
     "@media (max-width:640px){",
     "  #gcfg-bar .gcfg-files{display:none;}",
     "  #gcfg-bar .gcfg-pill{margin:8px 8px;padding:8px 10px 8px 12px;gap:10px;}",
@@ -114,7 +122,7 @@
   ].join("\n");
   document.head.appendChild(style);
 
-  // ── Build DOM ───────────────────────────────────────────────────────
+  // ── DOM ─────────────────────────────────────────────────────────────
   var bar = document.createElement("div");
   bar.id = "gcfg-bar";
   bar.innerHTML = [
@@ -122,20 +130,20 @@
     '  <div class="gcfg-dot">{}</div>',
     '  <div class="gcfg-time" aria-label="time remaining">--:--</div>',
     '  <div class="gcfg-text">',
-    '    <span class="gcfg-title">Config changes pending</span>',
+    '    <span class="gcfg-title">Workspace changes pending</span>',
     '    <span class="gcfg-files"></span>',
     "  </div>",
-    '  <button class="gcfg-btn gcfg-confirm" type="button">Confirm</button>',
-    '  <button class="gcfg-btn gcfg-revert"  type="button">Revert</button>',
+    '  <button class="gcfg-btn gcfg-primary"   data-action="primary"   type="button">Apply</button>',
+    '  <button class="gcfg-btn gcfg-secondary" data-action="secondary" type="button">Discard</button>',
     "</div>",
   ].join("\n");
   document.body.appendChild(bar);
-  bar.querySelector(".gcfg-confirm").addEventListener("click", function () {
-    window.__gcfgConfirm();
-  });
-  bar.querySelector(".gcfg-revert").addEventListener("click", function () {
-    window.__gcfgRevert();
-  });
+
+  var titleEl = bar.querySelector(".gcfg-title");
+  var filesEl = bar.querySelector(".gcfg-files");
+  var timeEl  = bar.querySelector(".gcfg-time");
+  var primaryBtn   = bar.querySelector('[data-action="primary"]');
+  var secondaryBtn = bar.querySelector('[data-action="secondary"]');
 
   var toast = document.createElement("div");
   toast.id = "gcfg-toast";
@@ -151,70 +159,123 @@
   function showToast(text, cls) {
     toast.textContent = text;
     toast.className = cls + " show";
-    setTimeout(function () {
-      toast.className = "";
-    }, 3200);
+    setTimeout(function () { toast.className = ""; }, 3200);
+  }
+  function joinFiles(files) {
+    if (!files || !files.length) return "";
+    var head = files.slice(0, 4).join("  ·  ");
+    return files.length > 4 ? head + "  +" + (files.length - 4) + " more" : head;
+  }
+  function setBusy(busy) {
+    primaryBtn.disabled = busy;
+    secondaryBtn.disabled = busy;
   }
 
-  // ── Poll loop ───────────────────────────────────────────────────────
+  // mode === "workspace" | "pending" | null
+  var currentMode = null;
+
+  function renderWorkspace(d) {
+    if (currentMode !== "workspace") {
+      currentMode = "workspace";
+      bar.classList.add("workspace");
+      bar.classList.remove("urgent");
+      primaryBtn.textContent = "Apply";
+      secondaryBtn.textContent = "Discard";
+    }
+    titleEl.textContent = "Workspace changes ready to apply";
+    filesEl.textContent = joinFiles(d.workspace && d.workspace.changedFiles);
+    bar.classList.add("show");
+    document.body.style.paddingTop = "62px";
+  }
+
+  function renderPending(d) {
+    if (currentMode !== "pending") {
+      currentMode = "pending";
+      bar.classList.remove("workspace");
+      primaryBtn.textContent = "Confirm";
+      secondaryBtn.textContent = "Revert";
+    }
+    titleEl.textContent = "Applied — confirm or revert before timeout";
+    filesEl.textContent = joinFiles(d.changedFiles);
+    timeEl.textContent = fmt(d.remainingMs);
+    if (d.remainingMs < 120000) bar.classList.add("urgent");
+    else bar.classList.remove("urgent");
+    bar.classList.add("show");
+    document.body.style.paddingTop = "62px";
+  }
+
+  function hideBar() {
+    currentMode = null;
+    bar.classList.remove("show", "urgent", "workspace");
+    document.body.style.paddingTop = "";
+  }
+
+  // ── Poll ────────────────────────────────────────────────────────────
   function poll() {
     fetch(API_BASE + "status", { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d.status === "pending") {
-          bar.classList.add("show");
-          bar.querySelector(".gcfg-time").textContent = fmt(d.remainingMs);
-          var files = d.changedFiles || [];
-          bar.querySelector(".gcfg-files").textContent =
-            files.length === 0
-              ? ""
-              : files.slice(0, 4).join("  ·  ") +
-                (files.length > 4 ? "  +" + (files.length - 4) + " more" : "");
-          if (d.remainingMs < 120000) bar.classList.add("urgent");
-          else bar.classList.remove("urgent");
-          document.body.style.paddingTop = "62px";
+          renderPending(d);
+        } else if (d.workspace && d.workspace.dirty) {
+          renderWorkspace(d);
         } else {
-          bar.classList.remove("show", "urgent");
-          document.body.style.paddingTop = "";
+          hideBar();
         }
       })
-      .catch(function () {
-        bar.classList.remove("show", "urgent");
-        document.body.style.paddingTop = "";
-      });
+      .catch(hideBar);
   }
 
   // ── Actions ─────────────────────────────────────────────────────────
-  window.__gcfgConfirm = function () {
-    fetch(API_BASE + "confirm", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (d.ok) {
-          showToast("Changes confirmed", "success");
-          bar.classList.remove("show", "urgent");
-          document.body.style.paddingTop = "";
+  function callAction(verb, opts) {
+    opts = opts || {};
+    if (opts.confirm && !confirm(opts.confirm)) return;
+    setBusy(true);
+    fetch(API_BASE + verb, { method: "POST" })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+      .then(function (resp) {
+        if (resp.ok && resp.body.ok) {
+          showToast(opts.successMsg || "Done", opts.successCls || "success");
+          if (opts.hide) hideBar();
+        } else {
+          showToast(resp.body.message || "Action failed", "error");
         }
       })
-      .catch(function () {});
-    poll();
-  };
+      .catch(function () { showToast("Network error", "error"); })
+      .then(function () { setBusy(false); poll(); });
+  }
 
-  window.__gcfgRevert = function () {
-    if (!confirm("Revert all pending changes?\n\nThis restores the last confirmed config and triggers a Home Assistant reload.")) {
-      return;
+  primaryBtn.addEventListener("click", function () {
+    if (currentMode === "workspace") {
+      callAction("apply", {
+        successMsg: "Applied — HA reloading. Confirm before timeout.",
+        successCls: "info",
+      });
+    } else if (currentMode === "pending") {
+      callAction("confirm", {
+        successMsg: "Changes confirmed",
+        successCls: "success",
+        hide: true,
+      });
     }
-    fetch(API_BASE + "revert", { method: "POST" })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (d.ok) {
-          showToast("Reverted — HA reloading", "reverted");
-          bar.classList.remove("show", "urgent");
-          document.body.style.paddingTop = "";
-        }
-      })
-      .catch(function () {});
-    poll();
-  };
+  });
+  secondaryBtn.addEventListener("click", function () {
+    if (currentMode === "workspace") {
+      callAction("discard", {
+        confirm: "Discard all workspace edits and reset to /config?",
+        successMsg: "Workspace reset to /config",
+        successCls: "info",
+        hide: true,
+      });
+    } else if (currentMode === "pending") {
+      callAction("revert", {
+        confirm: "Revert pending changes?\n\nThis restores /config from backup and reloads HA.",
+        successMsg: "Reverted — HA reloading",
+        successCls: "reverted",
+        hide: true,
+      });
+    }
+  });
 
   setInterval(poll, POLL_MS);
   poll();

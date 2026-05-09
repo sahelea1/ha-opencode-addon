@@ -33,9 +33,9 @@ COPY run.sh /run.sh
 RUN chmod +x /run.sh
 
 LABEL \
-    io.hass.version="1.14.0" \
+    io.hass.version="1.15.0" \
     io.hass.type="addon" \
     io.hass.arch="aarch64|amd64"
 
-WORKDIR /config
+# WORKDIR is set inside run.sh after the workspace is initialized.
 CMD ["/run.sh"]
