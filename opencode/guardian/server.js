@@ -1,13 +1,23 @@
 /**
- * OpenCode Guardian Server
+ * ha-opencode-addon — Guardian Server
  *
- * Responsibilities:
- * 1. Spawn and manage OpenCode web process on port 8100 (internal)
- * 2. Reverse-proxy all traffic from port 8099 → OpenCode
- * 3. Inject guardian banner script into HTML responses
- * 4. Monitor /config for file changes (hash-based polling)
- * 5. Manage backup/restore lifecycle with 10-min confirm window
- * 6. On timeout or crash-recovery: revert config and reload HA
+ * Boots OpenCode (`opencode serve`) on a private port, proxies the
+ * web UI through HA's ingress on 8099, and watches /config for
+ * unconfirmed edits with a 10-minute auto-revert safety net.
+ *
+ * Flow:
+ *   1. On startup: rsync /config -> /data/last-known-good (baseline).
+ *   2. Poll /config every 5s, hash the relevant files.
+ *   3. When the hash changes: open a 10-min confirm window.
+ *   4. If the user clicks "Confirm": baseline = current state.
+ *   5. If the timer expires (or the container crash-recovers in
+ *      pending state): rsync the baseline BACK into /config,
+ *      then ask HA Supervisor to reload.
+ *
+ * The restore step deliberately runs WITHOUT --delete and with a
+ * sane-backup precondition, because v1.7's restore wiped /config
+ * when the backup was empty/partial. Files added after the baseline
+ * are left for the user to review, never silently deleted.
  */
 
 const http = require("http");
@@ -20,8 +30,8 @@ const { spawn, execSync } = require("child_process");
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const OPENCODE_PORT = 8100;
-const GUARDIAN_PORT = 8099;
+const OPENCODE_PORT = 8100; // OpenCode binds here on 127.0.0.1
+const GUARDIAN_PORT = 8099; // HA ingress hits this
 const CONFIG_DIR = "/config";
 const DATA_DIR = "/data";
 const BACKUP_DIR = path.join(DATA_DIR, "last-known-good");
@@ -31,32 +41,28 @@ const POLL_INTERVAL_MS = 5000;
 const TIMEOUT_MS =
   (parseInt(process.env.GUARDIAN_TIMEOUT_MIN, 10) || 10) * 60 * 1000;
 
-// Files/dirs to exclude from hashing and backup
+// HA-managed paths we never back up or hash. Most are dynamic state
+// (DB, secrets, .storage); .HA_VERSION changes on every HA upgrade.
 const EXCLUDES = [
   "home-assistant_v2.db",
   "home-assistant_v2.db-shm",
   "home-assistant_v2.db-wal",
   ".storage",
-  ".git",
   ".cloud",
   "deps",
   "__pycache__",
   "tts",
   ".HA_VERSION",
 ];
-
 const RSYNC_EXCLUDES = EXCLUDES.map((e) => `--exclude=${e}`).join(" ");
 
-// ---------------------------------------------------------------------------
-// Guardian client script (injected into OpenCode HTML)
-// ---------------------------------------------------------------------------
 const CLIENT_SCRIPT = fs.readFileSync(
   path.join(__dirname, "client.js"),
   "utf8"
 );
 
 // ---------------------------------------------------------------------------
-// State Management
+// State (persisted to disk so we survive container restarts)
 // ---------------------------------------------------------------------------
 let state = {
   status: "idle", // "idle" | "pending"
@@ -68,8 +74,7 @@ let state = {
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
-      const saved = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      Object.assign(state, saved);
+      Object.assign(state, JSON.parse(fs.readFileSync(STATE_FILE, "utf8")));
     }
   } catch (e) {
     console.error("[guardian] Failed to load state:", e.message);
@@ -80,14 +85,15 @@ function saveState() {
   try {
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-    fs.renameSync(tmp, STATE_FILE); // atomic write
+    fs.renameSync(tmp, STATE_FILE);
   } catch (e) {
     console.error("[guardian] Failed to save state:", e.message);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Config Hashing — detect changes by hashing all relevant files
+// Change detection — md5 over the YAML/JSON/PY/CONF/JS files in /config.
+// We don't hash the whole tree because the HA DB constantly changes.
 // ---------------------------------------------------------------------------
 function getConfigHash() {
   try {
@@ -103,46 +109,39 @@ function getConfigHash() {
 }
 
 // ---------------------------------------------------------------------------
-// Backup / Restore
-//
-// SAFETY: restore must NEVER use `--delete` against /config. A partial
-// or stale backup combined with `--delete` would wipe the user's HA
-// configuration. We only copy files (so missing-from-config files come
-// back, modified files revert) and we sanity-check the backup before
-// touching /config at all.
+// Backup + restore
 // ---------------------------------------------------------------------------
 function countFiles(dir) {
   try {
-    const out = execSync(
-      `find ${dir} -mindepth 1 -maxdepth 6 -type f 2>/dev/null | wc -l`,
-      { encoding: "utf8", timeout: 10000 }
-    );
-    return parseInt(out.trim(), 10) || 0;
+    return parseInt(
+      execSync(
+        `find ${dir} -mindepth 1 -maxdepth 6 -type f 2>/dev/null | wc -l`,
+        { encoding: "utf8", timeout: 10000 }
+      ).trim(),
+      10
+    ) || 0;
   } catch {
     return 0;
   }
 }
 
+// Sanity check: never restore from an empty / non-HA-looking dir.
+// Without this, a partial first-boot snapshot + --delete combo
+// would wipe the user's real /config.
 function backupLooksSane() {
   if (!fs.existsSync(BACKUP_DIR)) return false;
-  const files = countFiles(BACKUP_DIR);
-  // A real HA /config has dozens of files at minimum (configuration.yaml,
-  // automations.yaml, plus integrations). Refuse to "restore" from
-  // anything that looks suspiciously empty.
-  if (files < 5) {
+  if (countFiles(BACKUP_DIR) < 5) {
     console.error(
-      `[guardian] Backup at ${BACKUP_DIR} only has ${files} files — refusing to use it.`
+      `[guardian] Backup at ${BACKUP_DIR} has fewer than 5 files — refusing to restore.`
     );
     return false;
   }
-  // Also require at least one of the canonical HA entrypoints.
-  const sentinels = ["configuration.yaml", "configuration.yml", ".HA_VERSION"];
-  const hasSentinel = sentinels.some((s) =>
+  const hasSentinel = ["configuration.yaml", "configuration.yml"].some((s) =>
     fs.existsSync(path.join(BACKUP_DIR, s))
   );
   if (!hasSentinel) {
     console.error(
-      `[guardian] Backup at ${BACKUP_DIR} has no HA sentinel file — refusing to use it.`
+      `[guardian] Backup at ${BACKUP_DIR} has no configuration.yaml — refusing to restore.`
     );
     return false;
   }
@@ -152,16 +151,14 @@ function backupLooksSane() {
 function createBackup() {
   try {
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    // Copy /config -> backup. `--delete` here only affects /data, not
-    // /config, so it is safe.
+    // --delete here is safe because it operates on /data/last-known-good,
+    // never on /config.
     execSync(
       `rsync -a --delete ${RSYNC_EXCLUDES} ${CONFIG_DIR}/ ${BACKUP_DIR}/`,
       { timeout: 120000 }
     );
     console.log(
-      "[guardian] Backup created at",
-      BACKUP_DIR,
-      `(${countFiles(BACKUP_DIR)} files)`
+      `[guardian] Backup created at ${BACKUP_DIR} (${countFiles(BACKUP_DIR)} files)`
     );
   } catch (e) {
     console.error("[guardian] Backup failed:", e.message);
@@ -171,15 +168,15 @@ function createBackup() {
 function restoreBackup() {
   if (!backupLooksSane()) {
     console.error(
-      "[guardian] Aborting restore: backup is missing, empty, or doesn't look like a real HA config."
+      "[guardian] Aborting restore: backup is missing/empty/doesn't look like an HA config."
     );
     return false;
   }
   try {
-    // No `--delete`. We only copy files BACK from the backup. If
-    // OpenCode created new files we didn't snapshot, they remain on
-    // disk for the user to review or remove themselves — much safer
-    // than nuking /config to a possibly-stale baseline.
+    // No --delete: copy baseline files BACK into /config. Modified
+    // files revert, deleted files come back. Files OpenCode created
+    // that weren't in the baseline stay on disk for the user to
+    // review or remove themselves — much safer than nuking /config.
     execSync(
       `rsync -a ${RSYNC_EXCLUDES} ${BACKUP_DIR}/ ${CONFIG_DIR}/`,
       { timeout: 120000 }
@@ -195,8 +192,6 @@ function restoreBackup() {
 function getChangedFiles() {
   try {
     if (!fs.existsSync(BACKUP_DIR)) return [];
-    const cmd = `diff -rq ${RSYNC_EXCLUDES.replace(/--exclude=/g, "--exclude=")} ${BACKUP_DIR}/ ${CONFIG_DIR}/ 2>/dev/null | head -30 || true`;
-    // Use rsync dry-run instead - more reliable
     const output = execSync(
       `rsync -n -a --delete ${RSYNC_EXCLUDES} --out-format='%n' ${CONFIG_DIR}/ ${BACKUP_DIR}/ 2>/dev/null | head -30 || true`,
       { encoding: "utf8", timeout: 10000 }
@@ -205,7 +200,7 @@ function getChangedFiles() {
       .split("\n")
       .filter((l) => l.trim() && !l.endsWith("/"))
       .map((f) => f.trim());
-  } catch (e) {
+  } catch {
     return [];
   }
 }
@@ -213,45 +208,43 @@ function getChangedFiles() {
 // ---------------------------------------------------------------------------
 // HA Supervisor API
 // ---------------------------------------------------------------------------
-function supervisorRequest(path, method, callback) {
+function supervisorRequest(p, method, callback) {
   const token = process.env.SUPERVISOR_TOKEN;
   if (!token) {
-    console.log("[guardian] No SUPERVISOR_TOKEN, skipping API call:", path);
+    console.log("[guardian] No SUPERVISOR_TOKEN, skipping API call:", p);
     if (callback) callback(false);
     return;
   }
-
-  const options = {
-    hostname: "supervisor",
-    port: 80,
-    path: path,
-    method: method || "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
+  const req = http.request(
+    {
+      hostname: "supervisor",
+      port: 80,
+      path: p,
+      method: method || "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 30000,
     },
-    timeout: 30000,
-  };
-
-  const req = http.request(options, (res) => {
-    let data = "";
-    res.on("data", (chunk) => (data += chunk));
-    res.on("end", () => {
-      console.log(`[guardian] Supervisor ${path}: ${res.statusCode}`);
-      if (callback) callback(res.statusCode >= 200 && res.statusCode < 300, data);
-    });
-  });
-
+    (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        console.log(`[guardian] Supervisor ${p}: ${res.statusCode}`);
+        if (callback)
+          callback(res.statusCode >= 200 && res.statusCode < 300, data);
+      });
+    }
+  );
   req.on("error", (e) => {
-    console.error(`[guardian] Supervisor API error (${path}):`, e.message);
+    console.error(`[guardian] Supervisor API error (${p}):`, e.message);
     if (callback) callback(false);
   });
-
   req.on("timeout", () => {
     req.destroy();
     if (callback) callback(false);
   });
-
   req.end();
 }
 
@@ -270,11 +263,11 @@ function reloadHA() {
 }
 
 // ---------------------------------------------------------------------------
-// Confirm / Revert Logic
+// Confirm / revert
 // ---------------------------------------------------------------------------
 function confirmChanges() {
   console.log("[guardian] User confirmed changes");
-  createBackup(); // New baseline = current (confirmed) state
+  createBackup(); // new baseline
   state.status = "idle";
   state.deadline = null;
   state.changedFiles = [];
@@ -291,31 +284,24 @@ function revertChanges() {
   state.changedFiles = [];
   state.lastHash = getConfigHash();
   saveState();
-
   if (restored) {
     reloadHA();
     return { ok: true, message: "Changes reverted. HA reload triggered." };
   }
-  return { ok: false, message: "Restore failed — no backup found." };
+  return { ok: false, message: "Restore failed — backup unavailable." };
 }
 
 // ---------------------------------------------------------------------------
-// Crash Recovery — runs on startup before anything else
+// Crash recovery — if the container died with status=pending, revert.
 // ---------------------------------------------------------------------------
 function crashRecovery() {
   loadState();
   if (state.status === "pending") {
-    console.log(
-      "============================================================"
-    );
-    console.log("  CRASH RECOVERY: Unconfirmed changes found — reverting!");
-    console.log(
-      "============================================================"
-    );
+    console.log("======================================================");
+    console.log("  CRASH RECOVERY: pending changes found — reverting!");
+    console.log("======================================================");
     if (fs.existsSync(BACKUP_DIR)) {
       restoreBackup();
-      console.log("[guardian] Config restored to last known good state");
-      // HA will reload on its own since it's restarting, or we trigger it
       setTimeout(() => reloadHA(), 5000);
     }
     state.status = "idle";
@@ -326,32 +312,31 @@ function crashRecovery() {
 }
 
 // ---------------------------------------------------------------------------
-// File Watcher — poll-based change detection
+// File watcher
 // ---------------------------------------------------------------------------
 function startWatcher() {
   state.lastHash = getConfigHash();
-  console.log("[guardian] Watcher started (polling every %ds)", POLL_INTERVAL_MS / 1000);
+  console.log(
+    `[guardian] Watcher started (polling every ${POLL_INTERVAL_MS / 1000}s)`
+  );
 
   setInterval(() => {
     try {
       const currentHash = getConfigHash();
-      if (!currentHash) return; // hash failed, skip this cycle
+      if (!currentHash) return;
 
       if (state.status === "idle") {
         if (currentHash !== state.lastHash) {
-          console.log("[guardian] ⚡ Config changes detected!");
+          console.log("[guardian] Config changes detected — opening confirm window");
           state.status = "pending";
           state.deadline = Date.now() + TIMEOUT_MS;
           state.changedFiles = getChangedFiles();
           saveState();
         }
       } else if (state.status === "pending") {
-        // Update changed files list
         state.changedFiles = getChangedFiles();
-
-        // Check for timeout
         if (Date.now() > state.deadline) {
-          console.log("[guardian] ⏰ TIMEOUT — reverting all changes");
+          console.log("[guardian] TIMEOUT — auto-reverting");
           revertChanges();
           return;
         }
@@ -364,31 +349,24 @@ function startWatcher() {
 }
 
 // ---------------------------------------------------------------------------
-// OpenCode Process Manager
+// OpenCode process manager
 // ---------------------------------------------------------------------------
 let opencodeProcess = null;
 let opencodeReady = false;
 
 function startOpenCode() {
   console.log(
-    "[guardian] Starting `opencode serve` for %s on 127.0.0.1:%d ...",
-    CONFIG_DIR,
-    OPENCODE_PORT
+    `[guardian] Starting \`opencode serve\` for ${CONFIG_DIR} on 127.0.0.1:${OPENCODE_PORT}`
   );
 
-  // `opencode serve` and `opencode web` ship the same SPA. We use
-  // `serve` because `web` additionally tries to launch a desktop
-  // browser via xdg-open, which is meaningless inside the add-on
-  // container and previously caused the UI to come up in an empty
-  // state. Persistence (auth, projects, sessions) lives under
-  // ~/.local/share/opencode + ~/.config/opencode, which run.sh has
-  // symlinked into /data/oc-v3 already, so there is nothing to set
-  // here beyond inheriting the shell environment.
+  // `serve` (not `web`) — `web` tries to launch a desktop browser
+  // via xdg-open on startup, which is meaningless inside the
+  // container and previously left the SPA half-initialized.
   opencodeProcess = spawn(
     "opencode",
     ["serve", "--hostname", "127.0.0.1", "--port", String(OPENCODE_PORT)],
     {
-      cwd: CONFIG_DIR,
+      cwd: CONFIG_DIR, // project root = HA /config
       stdio: "inherit",
       env: process.env,
     }
@@ -401,12 +379,11 @@ function startOpenCode() {
   opencodeProcess.on("exit", (code, signal) => {
     opencodeReady = false;
     console.log(
-      `[guardian] OpenCode exited (code=${code}, signal=${signal}), restarting in 5s...`
+      `[guardian] OpenCode exited (code=${code}, signal=${signal}), restarting in 5s`
     );
     setTimeout(startOpenCode, 5000);
   });
 
-  // Probe until OpenCode is ready
   const readyCheck = setInterval(() => {
     const req = http.get(
       `http://127.0.0.1:${OPENCODE_PORT}/`,
@@ -417,16 +394,27 @@ function startOpenCode() {
           console.log("[guardian] OpenCode is ready");
           clearInterval(readyCheck);
         }
-        res.resume(); // drain response
+        res.resume();
       }
     );
-    req.on("error", () => {}); // not ready yet
+    req.on("error", () => {});
     req.on("timeout", () => req.destroy());
   }, 2000);
 }
 
 // ---------------------------------------------------------------------------
-// HTTP Proxy + Guardian API Server
+// HTTP proxy — forwards to OpenCode, injects guardian banner into HTML,
+// and rewrites paths so the SPA loads correctly behind HA ingress.
+//
+// HA proxies the add-on under a path prefix like
+//   /api/hassio_ingress/<TOKEN>/
+// but strips that prefix before forwarding. The browser still uses
+// the full HA URL, so absolute paths in OpenCode's HTML
+// (src="/assets/app.js") resolve against HA's root and 404. Three
+// layers fix it:
+//   1. Inject <base href="<prefix>/"> so RELATIVE paths resolve.
+//   2. Regex over the HTML to prefix absolute src/href/action.
+//   3. Runtime patcher wraps fetch / XHR / WebSocket.
 // ---------------------------------------------------------------------------
 const proxy = httpProxy.createProxyServer({
   target: `http://127.0.0.1:${OPENCODE_PORT}`,
@@ -434,40 +422,23 @@ const proxy = httpProxy.createProxyServer({
   ws: true,
 });
 
-// Strip accept-encoding so we receive uncompressed HTML to inject into.
-// Forward X-Ingress-Path so OpenCode can optionally use it.
 proxy.on("proxyReq", (proxyReq, req) => {
   proxyReq.removeHeader("accept-encoding");
   const ip = req.headers["x-ingress-path"];
   if (ip) proxyReq.setHeader("x-ingress-path", ip);
 });
 
-// Handle proxied responses — inject guardian script into HTML
 proxy.on("proxyRes", (proxyRes, req, res) => {
   const contentType = proxyRes.headers["content-type"] || "";
 
   if (contentType.includes("text/html")) {
     const chunks = [];
-    proxyRes.on("data", (chunk) => chunks.push(chunk));
+    proxyRes.on("data", (c) => chunks.push(c));
     proxyRes.on("end", () => {
       let body = Buffer.concat(chunks).toString("utf8");
-
-      // ── HA Ingress path fix ────────────────────────────────────────
-      // HA proxies the add-on under a path prefix such as
-      //   /api/hassio_ingress/TOKEN/
-      // but strips that prefix before forwarding requests to us, so
-      // OpenCode sees normal paths.  The browser however still uses the
-      // full HA URL, meaning absolute paths like src="/assets/app.js"
-      // resolve to HA's own root and the app never loads (blank page).
-      //
-      // Fix in three layers:
-      //   1. <base href="…"> — makes RELATIVE paths resolve correctly
-      //   2. Attribute regex — rewrites absolute paths already in the HTML
-      //   3. JS runtime patch — intercepts fetch / XHR / WebSocket calls
-      //      that construct absolute paths dynamically
       const ingressPath = (req.headers["x-ingress-path"] || "").replace(/\/$/, "");
 
-      // Layer 2: rewrite absolute src/href/action attributes in the raw HTML
+      // Layer 2: rewrite absolute attribute paths in the HTML.
       if (ingressPath) {
         body = body.replace(
           /((?:src|href|action|data-src)=["'])(\/(?!\/))/g,
@@ -475,53 +446,167 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
         );
       }
 
-      // Layer 1 + 3: inject <base> and the runtime JS patcher + guardian banner
+      // Layer 1 + 3: <base> + runtime patcher + guardian banner.
       const baseHref = ingressPath ? `${ingressPath}/` : "/";
       const injection = `<base href="${baseHref}">
 <script>
 window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
-/* ── HA Ingress runtime path patcher ── */
 (function () {
   var _ip = ${JSON.stringify(ingressPath)};
   if (!_ip) return;
-  function fixPath(u) {
-    if (typeof u !== "string") return u;
-    if (u.charAt(0) === "/" && u.slice(0, _ip.length) !== _ip) return _ip + u;
-    return u;
+  var _origin = window.location.origin;
+  var _wsHost = window.location.host;
+
+  // Returns the rewritten URL string if rewriting is needed, else null.
+  // Handles: relative paths, root-absolute paths, and same-origin absolute URLs.
+  function rewriteHttpUrl(input) {
+    if (typeof input !== "string") return null;
+    try {
+      // Fast path: root-absolute path that doesn't already have the prefix.
+      if (input.charAt(0) === "/" && input.charAt(1) !== "/") {
+        if (input.slice(0, _ip.length) !== _ip) return _ip + input;
+        return null;
+      }
+      // Otherwise: try to parse as URL (relative or absolute).
+      var u = new URL(input, _origin);
+      if (u.origin === _origin && u.pathname.slice(0, _ip.length) !== _ip) {
+        u.pathname = _ip + u.pathname;
+        return u.toString();
+      }
+    } catch (e) {}
+    return null;
   }
-  /* fetch */
+
+  function rewriteWsUrl(input) {
+    if (typeof input !== "string") return null;
+    try {
+      var u = new URL(input);
+      if (u.host === _wsHost && u.pathname.slice(0, _ip.length) !== _ip) {
+        u.pathname = _ip + u.pathname;
+        return u.toString();
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  // ---- fetch ---------------------------------------------------------------
   var _fetch = window.fetch;
   window.fetch = function (resource, init) {
-    return _fetch.call(this, typeof resource === "string" ? fixPath(resource) : resource, init);
+    try {
+      // Request object: rebuild with rewritten URL.
+      if (typeof Request !== "undefined" && resource instanceof Request) {
+        var newUrl = rewriteHttpUrl(resource.url);
+        if (newUrl) {
+          var hasBody = resource.method !== "GET" && resource.method !== "HEAD";
+          var initFromReq = {
+            method: resource.method,
+            headers: resource.headers,
+            mode: resource.mode === "navigate" ? "same-origin" : resource.mode,
+            credentials: resource.credentials,
+            cache: resource.cache,
+            redirect: resource.redirect,
+            referrer: resource.referrer,
+            integrity: resource.integrity,
+            keepalive: resource.keepalive,
+            signal: resource.signal,
+          };
+          if (hasBody) {
+            // Materialize body to ArrayBuffer to avoid streaming-body pitfalls.
+            return resource.clone().arrayBuffer().then(function (buf) {
+              if (buf && buf.byteLength > 0) initFromReq.body = buf;
+              if (init) Object.assign(initFromReq, init);
+              return _fetch.call(window, newUrl, initFromReq);
+            });
+          }
+          if (init) Object.assign(initFromReq, init);
+          return _fetch.call(this, newUrl, initFromReq);
+        }
+        return _fetch.call(this, resource, init);
+      }
+
+      // String URL.
+      if (typeof resource === "string") {
+        var s = rewriteHttpUrl(resource);
+        if (s !== null) resource = s;
+        return _fetch.call(this, resource, init);
+      }
+
+      // URL object.
+      if (resource && typeof resource.href === "string") {
+        var s2 = rewriteHttpUrl(resource.href);
+        if (s2 !== null) return _fetch.call(this, s2, init);
+      }
+    } catch (e) {}
+    return _fetch.call(this, resource, init);
   };
-  /* XMLHttpRequest */
+
+  // ---- XMLHttpRequest ------------------------------------------------------
   var _open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
-    arguments[1] = fixPath(url);
+    if (typeof url === "string") {
+      var s = rewriteHttpUrl(url);
+      if (s !== null) arguments[1] = s;
+    } else if (url && typeof url.href === "string") {
+      var s2 = rewriteHttpUrl(url.href);
+      if (s2 !== null) arguments[1] = s2;
+    }
     return _open.apply(this, arguments);
   };
-  /* WebSocket — rewrite the pathname portion only */
+
+  // ---- WebSocket -----------------------------------------------------------
   var _WS = window.WebSocket;
   function PatchedWS(url, protocols) {
     if (typeof url === "string") {
-      try {
-        var u = new URL(url);
-        if (u.pathname.charAt(0) === "/" && u.pathname.slice(0, _ip.length) !== _ip) {
-          u.pathname = _ip + u.pathname;
-          url = u.toString();
-        }
-      } catch (e) {}
+      var s = rewriteWsUrl(url);
+      if (s !== null) url = s;
+    } else if (url && typeof url.href === "string") {
+      var s2 = rewriteWsUrl(url.href);
+      if (s2 !== null) url = s2;
     }
     return protocols !== undefined ? new _WS(url, protocols) : new _WS(url);
   }
   PatchedWS.prototype = _WS.prototype;
   PatchedWS.CONNECTING = _WS.CONNECTING;
-  PatchedWS.OPEN      = _WS.OPEN;
-  PatchedWS.CLOSING   = _WS.CLOSING;
-  PatchedWS.CLOSED    = _WS.CLOSED;
+  PatchedWS.OPEN       = _WS.OPEN;
+  PatchedWS.CLOSING    = _WS.CLOSING;
+  PatchedWS.CLOSED     = _WS.CLOSED;
   window.WebSocket = PatchedWS;
+
+  // ---- EventSource (defensive) --------------------------------------------
+  if (typeof window.EventSource === "function") {
+    var _ES = window.EventSource;
+    function PatchedES(url, init) {
+      if (typeof url === "string") {
+        var s = rewriteHttpUrl(url);
+        if (s !== null) url = s;
+      } else if (url && typeof url.href === "string") {
+        var s2 = rewriteHttpUrl(url.href);
+        if (s2 !== null) url = s2;
+      }
+      return init !== undefined ? new _ES(url, init) : new _ES(url);
+    }
+    PatchedES.prototype  = _ES.prototype;
+    PatchedES.CONNECTING = _ES.CONNECTING;
+    PatchedES.OPEN       = _ES.OPEN;
+    PatchedES.CLOSED     = _ES.CLOSED;
+    window.EventSource = PatchedES;
+  }
+
+  // ---- navigator.sendBeacon (defensive) -----------------------------------
+  if (navigator && typeof navigator.sendBeacon === "function") {
+    var _sb = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      if (typeof url === "string") {
+        var s = rewriteHttpUrl(url);
+        if (s !== null) url = s;
+      } else if (url && typeof url.href === "string") {
+        var s2 = rewriteHttpUrl(url.href);
+        if (s2 !== null) url = s2;
+      }
+      return _sb(url, data);
+    };
+  }
 })();
-/* ── Guardian banner ── */
 ${CLIENT_SCRIPT}
 </script>`;
 
@@ -538,13 +623,13 @@ ${CLIENT_SCRIPT}
       delete headers["content-encoding"];
       delete headers["content-security-policy"];
       delete headers["content-security-policy-report-only"];
-      delete headers["x-frame-options"]; // allow embedding in HA iframe panels
+      delete headers["x-frame-options"]; // allow embedding in HA iframe
 
       res.writeHead(proxyRes.statusCode, headers);
       res.end(body);
     });
   } else {
-    // Non-HTML: pipe through unchanged
+    // Non-HTML: stream straight through (preserves SSE / chunked).
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   }
@@ -558,7 +643,9 @@ proxy.on("error", (err, req, res) => {
   }
 });
 
-// Fallback page shown while OpenCode boots up
+// ---------------------------------------------------------------------------
+// Loading + status pages
+// ---------------------------------------------------------------------------
 const LOADING_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -567,74 +654,27 @@ const LOADING_PAGE = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="refresh" content="3">
   <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-    :root{
-      --surface:#0a0e1a; --surface-1:#141828; --surface-2:#1c2238;
-      --primary:#a78bfa; --primary-2:#7c5cec; --text:#e2e8f0; --muted:#94a3b8;
-    }
-    body{
-      min-height:100dvh;background:
-        radial-gradient(1200px 600px at 70% -10%,rgba(124,92,236,.18),transparent 60%),
-        radial-gradient(900px 600px at -10% 110%,rgba(89,78,234,.16),transparent 55%),
-        var(--surface);
-      color:var(--text);
-      font:500 14px/1.5 'Inter','SF Pro Text',-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;
-      -webkit-font-smoothing:antialiased;
-      display:flex;align-items:center;justify-content:center;padding:24px;
-    }
-    .card{
-      width:100%;max-width:380px;text-align:center;
-      background:linear-gradient(180deg,rgba(28,34,56,.72),rgba(20,24,40,.72));
-      border:1px solid rgba(167,139,250,.18);border-radius:24px;
-      padding:36px 28px;
-      box-shadow:
-        0 1px 0 rgba(255,255,255,.04) inset,
-        0 24px 60px rgba(8,10,24,.55),
-        0 0 0 1px rgba(167,139,250,.08);
-      backdrop-filter:saturate(180%) blur(16px);
-      -webkit-backdrop-filter:saturate(180%) blur(16px);
-    }
-    .logo{
-      width:64px;height:64px;border-radius:18px;margin:0 auto 22px;
-      background:linear-gradient(135deg,#594EEA 0%,#7C5CEC 50%,#A259E6 100%);
-      box-shadow:0 12px 28px rgba(124,92,236,.45),
-                 inset 0 1px 0 rgba(255,255,255,.18);
-      display:flex;align-items:center;justify-content:center;
-      color:#fff;font:800 24px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
-      letter-spacing:-1.5px;
-    }
-    h1{font-size:18px;font-weight:600;color:#f1f5f9;letter-spacing:-.01em;margin-bottom:6px;}
-    p{font-size:13px;color:var(--muted);}
-    .progress{
-      margin:24px auto 0;width:200px;height:4px;border-radius:2px;
-      background:rgba(255,255,255,.05);overflow:hidden;
-    }
-    .progress::after{
-      content:"";display:block;width:40%;height:100%;border-radius:2px;
-      background:linear-gradient(90deg,transparent,var(--primary),transparent);
-      animation:slide 1.4s cubic-bezier(.4,0,.2,1) infinite;
-    }
-    @keyframes slide{
-      0%  {transform:translateX(-100%);}
-      100%{transform:translateX(350%);}
-    }
+    body { background:#0d1117; color:#c9d1d9; font-family:system-ui,sans-serif;
+      margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; }
+    .card { text-align:center; }
+    .spinner { width:40px; height:40px; margin:0 auto 18px; border-radius:50%;
+      border:3px solid #21262d; border-top-color:#58a6ff; animation:spin 0.8s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    h1 { font-size:18px; font-weight:500; margin:0 0 6px; }
+    p  { font-size:13px; color:#8b949e; margin:0; }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="logo">{}</div>
-    <h1>Starting ha-opencode-addon</h1>
-    <p>This will refresh automatically once the server is ready.</p>
-    <div class="progress" aria-hidden="true"></div>
+    <div class="spinner"></div>
+    <h1>ha-opencode-addon is starting…</h1>
+    <p>This page refreshes automatically.</p>
   </div>
 </body>
 </html>`;
 
-// Guardian status page (fallback if banner injection fails or for direct visits)
 function getStatusPage(req) {
-  const remaining = state.deadline
-    ? Math.max(0, state.deadline - Date.now())
-    : null;
+  const remaining = state.deadline ? Math.max(0, state.deadline - Date.now()) : null;
   const min = remaining ? Math.floor(remaining / 60000) : 0;
   const sec = remaining ? Math.ceil((remaining % 60000) / 1000) : 0;
   const ingressPath = req && req.headers["x-ingress-path"]
@@ -646,203 +686,68 @@ function getStatusPage(req) {
     .join("");
 
   return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Config Guardian — OpenCode</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="5">
-  <style>
-    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-    :root{
-      --surface:#0a0e1a; --surface-1:#141828; --surface-2:#1c2238;
-      --primary:#a78bfa; --primary-2:#7c5cec;
-      --success:#22c55e; --warning:#f59e0b; --danger:#f43f5e;
-      --text:#e2e8f0; --muted:#94a3b8; --border:rgba(167,139,250,.18);
-    }
-    html,body{height:100%;}
-    body{
-      background:
-        radial-gradient(1200px 600px at 80% -10%,rgba(124,92,236,.16),transparent 60%),
-        radial-gradient(900px 500px at -10% 110%,rgba(89,78,234,.14),transparent 55%),
-        var(--surface);
-      color:var(--text);
-      font:500 14px/1.5 'Inter','SF Pro Text',-apple-system,'Segoe UI',Roboto,system-ui,sans-serif;
-      -webkit-font-smoothing:antialiased;
-      display:flex;align-items:center;justify-content:center;padding:24px;
-    }
-    .wrap{width:100%;max-width:560px;}
-    .header{display:flex;align-items:center;gap:14px;margin-bottom:20px;}
-    .logo{
-      width:48px;height:48px;border-radius:14px;flex-shrink:0;
-      background:linear-gradient(135deg,#594EEA 0%,#7C5CEC 50%,#A259E6 100%);
-      box-shadow:0 8px 22px rgba(124,92,236,.45),inset 0 1px 0 rgba(255,255,255,.18);
-      display:flex;align-items:center;justify-content:center;color:#fff;
-      font:800 19px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
-      letter-spacing:-1.2px;
-    }
-    .header h1{font-size:20px;font-weight:600;color:#f1f5f9;letter-spacing:-.01em;}
-    .header p{font-size:13px;color:var(--muted);}
-
-    .card{
-      background:linear-gradient(180deg,rgba(28,34,56,.72),rgba(20,24,40,.72));
-      border:1px solid var(--border);border-radius:20px;
-      padding:24px;
-      box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 18px 48px rgba(8,10,24,.45);
-      backdrop-filter:saturate(180%) blur(16px);
-      -webkit-backdrop-filter:saturate(180%) blur(16px);
-    }
-
-    .badge{
-      display:inline-flex;align-items:center;gap:8px;
-      padding:6px 12px;border-radius:999px;font-size:12px;font-weight:600;
-      letter-spacing:.02em;
-    }
-    .badge.idle{background:rgba(34,197,94,.12);color:#86efac;border:1px solid rgba(34,197,94,.3);}
-    .badge.pending{background:rgba(245,158,11,.12);color:#fcd34d;border:1px solid rgba(245,158,11,.35);}
-    .badge .dot{width:6px;height:6px;border-radius:50%;}
-    .badge.idle .dot{background:#22c55e;box-shadow:0 0 8px #22c55e;}
-    .badge.pending .dot{background:#f59e0b;box-shadow:0 0 8px #f59e0b;animation:blink 1.4s ease-in-out infinite;}
-    @keyframes blink{50%{opacity:.3;}}
-
-    .timer{
-      font:700 56px/1 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
-      letter-spacing:-1px;color:var(--warning);
-      font-variant-numeric:tabular-nums;margin:18px 0 6px;
-    }
-    .timer.urgent{color:var(--danger);}
-    .timer-sub{font-size:13px;color:var(--muted);}
-
-    .files{
-      margin-top:18px;background:rgba(10,14,26,.6);
-      border:1px solid rgba(255,255,255,.05);border-radius:12px;
-      padding:14px 16px;
-    }
-    .files-label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:8px;}
-    .files ul{list-style:none;display:flex;flex-direction:column;gap:4px;}
-    .files code{
-      font:500 12px/1.6 ui-monospace,'JetBrains Mono','SF Mono',Menlo,monospace;
-      color:#cbd5e1;
-    }
-
-    .actions{display:flex;gap:10px;margin-top:22px;}
-    .btn{
-      flex:1;padding:12px 18px;border:0;border-radius:12px;
-      font:600 14px/1 inherit;letter-spacing:.02em;cursor:pointer;
-      transition:transform .12s,filter .2s,box-shadow .2s;
-      display:inline-flex;align-items:center;justify-content:center;gap:8px;
-    }
-    .btn:hover:not(:disabled){filter:brightness(1.1);transform:translateY(-1px);}
-    .btn:active:not(:disabled){transform:translateY(0);filter:brightness(.95);}
-    .btn:disabled{opacity:.35;cursor:not-allowed;}
-    .btn-confirm{
-      background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;
-      box-shadow:0 8px 22px rgba(34,197,94,.32);
-    }
-    .btn-revert{
-      background:rgba(244,63,94,.12);color:#fb7185;
-      border:1px solid rgba(244,63,94,.35);
-    }
-    .btn-revert:hover:not(:disabled){background:rgba(244,63,94,.22);}
-
-    .empty{text-align:center;padding:18px 0 6px;}
-    .empty-emoji{font-size:32px;margin-bottom:8px;}
-    .empty h2{font-size:16px;font-weight:600;color:#f1f5f9;margin-bottom:4px;}
-    .empty p{font-size:13px;color:var(--muted);}
-
-    .footer{
-      text-align:center;margin-top:18px;font-size:11px;color:#64748b;
-      letter-spacing:.04em;
-    }
-  </style>
-</head>
+<html><head><meta charset="utf-8">
+<title>Config Guardian</title>
+<meta http-equiv="refresh" content="5">
+<style>
+  body { background:#0d1117; color:#c9d1d9; font-family:system-ui,sans-serif; padding:32px; }
+  h1 { color:#58a6ff; font-size:20px; margin:0 0 16px; }
+  .card { background:#161b22; border:1px solid #30363d; border-left-width:4px;
+    border-radius:8px; padding:18px; margin-bottom:14px; }
+  .idle    { border-left-color:#3fb950; }
+  .pending { border-left-color:#d29922; }
+  .timer   { font-size:32px; font-weight:700; color:#d29922; margin:8px 0; }
+  ul { list-style:none; padding:0; margin:8px 0 0; font-size:12px; color:#8b949e; }
+  .actions { display:flex; gap:10px; }
+  button { padding:8px 18px; border:0; border-radius:6px; font-weight:600;
+    cursor:pointer; font-family:inherit; }
+  .confirm { background:#238636; color:#fff; }
+  .revert  { background:#da3633; color:#fff; }
+</style></head>
 <body>
-  <div class="wrap">
-    <div class="header">
-      <div class="logo">{}</div>
-      <div>
-        <h1>Config Guardian</h1>
-        <p>Safety net for OpenCode edits to your Home Assistant config.</p>
-      </div>
-    </div>
-
-    <div class="card">
-      <span class="badge ${isPending ? "pending" : "idle"}">
-        <span class="dot"></span>
-        ${isPending ? "Changes pending" : "All clear"}
-      </span>
-
-      ${
-        isPending
-          ? `<div class="timer ${remaining < 120000 ? "urgent" : ""}">${min}:${String(sec).padStart(2, "0")}</div>
-             <div class="timer-sub">until automatic revert</div>
-             ${
-               filesList
-                 ? `<div class="files">
-                      <div class="files-label">Files changed</div>
-                      <ul>${filesList}</ul>
-                    </div>`
-                 : ""
-             }
-             <div class="actions">
-               <form method="POST" action="${ingressPath}/__guardian__/api/confirm" style="flex:1">
-                 <button class="btn btn-confirm" type="submit">Confirm changes</button>
-               </form>
-               <form method="POST" action="${ingressPath}/__guardian__/api/revert" style="flex:1">
-                 <button class="btn btn-revert" type="submit">Revert</button>
-               </form>
-             </div>`
-          : `<div class="empty">
-               <div class="empty-emoji">✨</div>
-               <h2>No pending changes</h2>
-               <p>Your config is in a known-good state. Edits in OpenCode will appear here for confirmation.</p>
-             </div>`
-      }
-    </div>
-
-    <div class="footer">Auto-refreshes every 5 seconds</div>
+  <h1>Config Guardian</h1>
+  <div class="card ${isPending ? "pending" : "idle"}">
+    <strong>${isPending ? "Changes pending" : "All clear"}</strong>
+    ${isPending ? `<div class="timer">${min}:${String(sec).padStart(2, "0")}</div>
+      ${filesList ? `<ul>${filesList}</ul>` : ""}
+      <div class="actions">
+        <form method="POST" action="${ingressPath}/__guardian__/api/confirm">
+          <button class="confirm">Confirm changes</button>
+        </form>
+        <form method="POST" action="${ingressPath}/__guardian__/api/revert">
+          <button class="revert">Revert</button>
+        </form>
+      </div>` : ""}
   </div>
-</body>
-</html>`;
+</body></html>`;
 }
 
 // ---------------------------------------------------------------------------
-// Main HTTP Server
+// Main HTTP server
 // ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  const pathname = parsedUrl.pathname;
+  const pathname = new URL(req.url, `http://${req.headers.host || "localhost"}`).pathname;
 
-  // ── Guardian API ─────────────────────────────────────────
   if (pathname === "/__guardian__/api/status") {
-    const remaining = state.deadline
-      ? Math.max(0, state.deadline - Date.now())
-      : null;
+    const remaining = state.deadline ? Math.max(0, state.deadline - Date.now()) : null;
     res.writeHead(200, {
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
     });
-    res.end(
-      JSON.stringify({
-        status: state.status,
-        remainingMs: remaining,
-        changedFiles: state.changedFiles,
-        timeoutMinutes: TIMEOUT_MS / 60000,
-      })
-    );
+    res.end(JSON.stringify({
+      status: state.status,
+      remainingMs: remaining,
+      changedFiles: state.changedFiles,
+      timeoutMinutes: TIMEOUT_MS / 60000,
+    }));
     return;
   }
 
   if (pathname === "/__guardian__/api/confirm" && req.method === "POST") {
-    let result;
-    if (state.status === "pending") {
-      result = confirmChanges();
-    } else {
-      result = { ok: false, message: "No pending changes to confirm." };
-    }
-    // If request came from a form (not fetch), redirect back
-    const accept = req.headers.accept || "";
-    if (accept.includes("text/html")) {
+    const result = state.status === "pending"
+      ? confirmChanges()
+      : { ok: false, message: "No pending changes to confirm." };
+    if ((req.headers.accept || "").includes("text/html")) {
       res.writeHead(303, { Location: "/__guardian__/" });
       res.end();
     } else {
@@ -853,14 +758,10 @@ const server = http.createServer((req, res) => {
   }
 
   if (pathname === "/__guardian__/api/revert" && req.method === "POST") {
-    let result;
-    if (state.status === "pending") {
-      result = revertChanges();
-    } else {
-      result = { ok: false, message: "No pending changes to revert." };
-    }
-    const accept = req.headers.accept || "";
-    if (accept.includes("text/html")) {
+    const result = state.status === "pending"
+      ? revertChanges()
+      : { ok: false, message: "No pending changes to revert." };
+    if ((req.headers.accept || "").includes("text/html")) {
       res.writeHead(303, { Location: "/__guardian__/" });
       res.end();
     } else {
@@ -870,14 +771,12 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Guardian status page (fallback UI)
   if (pathname === "/__guardian__/" || pathname === "/__guardian__") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(getStatusPage(req));
     return;
   }
 
-  // ── Proxy to OpenCode ────────────────────────────────────
   if (!opencodeReady) {
     res.writeHead(503, { "Content-Type": "text/html; charset=utf-8" });
     res.end(LOADING_PAGE);
@@ -887,7 +786,6 @@ const server = http.createServer((req, res) => {
   proxy.web(req, res);
 });
 
-// WebSocket upgrade — proxy to OpenCode (no selfHandleResponse needed)
 server.on("upgrade", (req, socket, head) => {
   if (!opencodeReady) {
     socket.destroy();
@@ -897,33 +795,28 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ---------------------------------------------------------------------------
-// Boot Sequence
+// Boot
 // ---------------------------------------------------------------------------
 console.log("[guardian] Running crash recovery check...");
 crashRecovery();
-
 console.log("[guardian] Creating initial backup...");
 createBackup();
-
 console.log("[guardian] Starting file watcher...");
 startWatcher();
-
 console.log("[guardian] Launching OpenCode...");
 startOpenCode();
 
 server.listen(GUARDIAN_PORT, "0.0.0.0", () => {
-  console.log("[guardian] ✅ Guardian server listening on 0.0.0.0:%d", GUARDIAN_PORT);
-  console.log("[guardian] ✅ Confirm timeout: %d minutes", TIMEOUT_MS / 60000);
+  console.log(`[guardian] Listening on 0.0.0.0:${GUARDIAN_PORT}`);
+  console.log(`[guardian] Confirm timeout: ${TIMEOUT_MS / 60000} minutes`);
 });
 
-// Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("[guardian] SIGTERM received, shutting down...");
   if (opencodeProcess) opencodeProcess.kill("SIGTERM");
   server.close();
   process.exit(0);
 });
-
 process.on("SIGINT", () => {
   console.log("[guardian] SIGINT received, shutting down...");
   if (opencodeProcess) opencodeProcess.kill("SIGTERM");
