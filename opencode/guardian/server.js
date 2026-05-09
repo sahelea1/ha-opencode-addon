@@ -1,5 +1,5 @@
 /**
- * ha-opencode-addon — Guardian Server (v1.15, workspace mode)
+ * ha-opencode-addon — Guardian Server (v1.16, embedded-UI fixes)
  *
  * OpenCode now edits a sandboxed copy at /data/workspace, not /config
  * directly. This solves two real problems:
@@ -591,30 +591,28 @@ proxy.on("proxyRes", (proxyRes, req, res) => {
 <script>
 window.__GUARDIAN_BASE_PATH = ${JSON.stringify(ingressPath)};
 
-// Layout pre-seed: the SPA's stored default sets the file-tree panel to
-// closed and the "changes" tab. Override once per browser so first load
-// shows the full file tree on the "all" tab.
+// Layout force-seed: the SPA persists fileTree state in localStorage.
+// In the embedded (HA ingress) origin, prior versions of this seed
+// stored a one-shot flag and the SPA later overwrote opened=false,
+// leaving users stuck with a hidden file tree. We now force-set
+// fileTree.opened=true and tab="all" on every page load so the
+// embedded UI always boots with the workspace visible — same as
+// what users see when hitting the add-on's port directly.
 (function () {
   try {
-    if (localStorage.getItem("__guardian_seeded_v2")) return;
     var KEY = "opencode.global.dat:layout";
     var current = null;
     try { current = JSON.parse(localStorage.getItem(KEY) || "null"); } catch (e) {}
-    var needsFix =
-      !current ||
-      !current.fileTree ||
-      current.fileTree.opened === false ||
-      current.fileTree.tab === "changes";
-    if (needsFix) {
-      var merged = current && typeof current === "object" ? current : {};
-      merged.fileTree = Object.assign({ width: 280 }, merged.fileTree || {}, {
-        opened: true,
-        tab: "all",
-      });
-      if (!merged.sidebar) merged.sidebar = { opened: true };
-      localStorage.setItem(KEY, JSON.stringify(merged));
-    }
-    localStorage.setItem("__guardian_seeded_v2", "1");
+    var merged = current && typeof current === "object" ? current : {};
+    merged.fileTree = Object.assign({ width: 280 }, merged.fileTree || {}, {
+      opened: true,
+      tab: "all",
+    });
+    if (!merged.sidebar) merged.sidebar = { opened: true };
+    localStorage.setItem(KEY, JSON.stringify(merged));
+    // Clear the legacy one-shot flag so this code path is the
+    // single source of truth going forward.
+    try { localStorage.removeItem("__guardian_seeded_v2"); } catch (e) {}
   } catch (e) {}
 })();
 
@@ -770,6 +768,19 @@ ${CLIENT_SCRIPT}
         body = body.replace("</head>", injection + "\n</head>");
       } else {
         body = injection + body;
+      }
+
+      // Server-side mount point for the guardian banner. The client.js
+      // <script> runs from <head>, before the SPA's <body> is parsed —
+      // appendChild on a missing document.body silently fails inside
+      // some iframe / HA ingress contexts. Putting the placeholder
+      // directly in the served HTML guarantees a mount target exists
+      // by the time the SPA hydrates, regardless of script timing.
+      const placeholder = '<div id="gcfg-bar-host"></div>';
+      if (/<body[^>]*>/.test(body)) {
+        body = body.replace(/<body[^>]*>/, (m) => m + placeholder);
+      } else {
+        body = placeholder + body;
       }
 
       const headers = Object.assign({}, proxyRes.headers);
