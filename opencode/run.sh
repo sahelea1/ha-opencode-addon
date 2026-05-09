@@ -11,6 +11,14 @@ echo "========================================"
 #    rebuilds, and add-on updates unless the user chooses to clear it
 #    during uninstall). API keys, provider selection, login state,
 #    sessions, and cache/state files live in these dirs.
+#
+#    NOTE: We use a fresh path (/data/oc-v2/*) because earlier add-on
+#    versions (1.5) wrote a hand-crafted opencode.json with empty
+#    provider stubs into /data/opencode-config, which overrode
+#    OpenCode's built-in provider presets and produced a blank web UI.
+#    Switching to a new location guarantees a clean default state on
+#    upgrade. Old paths are renamed (not deleted) so the user can still
+#    recover anything they cared about.
 # ----------------------------------------------------------
 link_persistent_dir() {
     local target="$1"
@@ -31,16 +39,25 @@ link_persistent_dir() {
     ln -sfnT "$target" "$link"
 }
 
-mkdir -p /data/opencode-config
-mkdir -p /data/opencode-share
-mkdir -p /data/opencode-state
-mkdir -p /data/opencode-cache
+# Quarantine the legacy persistent dirs from add-on versions <= 1.7 so
+# their broken opencode.json / stale state cannot poison the new install.
+for legacy in opencode-config opencode-share opencode-state opencode-cache; do
+    if [ -d "/data/$legacy" ] && [ ! -L "/data/$legacy" ]; then
+        mv "/data/$legacy" "/data/${legacy}.legacy.$(date +%s)"
+        echo "[init] Quarantined legacy /data/$legacy"
+    fi
+done
+
+mkdir -p /data/oc-v2/config
+mkdir -p /data/oc-v2/share
+mkdir -p /data/oc-v2/state
+mkdir -p /data/oc-v2/cache
 mkdir -p /data/last-known-good
 
-link_persistent_dir /data/opencode-config /root/.config/opencode
-link_persistent_dir /data/opencode-share /root/.local/share/opencode
-link_persistent_dir /data/opencode-state /root/.local/state/opencode
-link_persistent_dir /data/opencode-cache /root/.cache/opencode
+link_persistent_dir /data/oc-v2/config /root/.config/opencode
+link_persistent_dir /data/oc-v2/share /root/.local/share/opencode
+link_persistent_dir /data/oc-v2/state /root/.local/state/opencode
+link_persistent_dir /data/oc-v2/cache /root/.cache/opencode
 
 export HOME=/root
 export XDG_CONFIG_HOME=/root/.config
@@ -65,10 +82,11 @@ fi
 
 export GUARDIAN_TIMEOUT_MIN="$TIMEOUT_MIN"
 
-# OpenCode ships with its own built-in provider/login presets. We don't
-# write a custom opencode.json — users pick providers and log in through
-# the web UI, and credentials persist under /data/opencode-config and
-# /data/opencode-share via the symlinks created above.
+# OpenCode ships with its own built-in provider/login presets. We do NOT
+# write any custom opencode.json — doing so previously (v1.5) replaced the
+# default presets with empty stubs and produced a blank UI. Users pick
+# providers and log in through the web UI, and credentials persist under
+# /data/oc-v2/{config,share,state,cache} via the symlinks created above.
 
 # ----------------------------------------------------------
 # 3. Validate HA config mount and clean up legacy add-on git repo
